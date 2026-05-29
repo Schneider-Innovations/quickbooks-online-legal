@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow, noarchive, nosnippet, noimageindex, notranslate">
+  <meta name="googlebot" content="noindex, nofollow, noarchive, nosnippet, noimageindex, notranslate">
+  <meta name="bingbot" content="noindex, nofollow, noarchive, nosnippet, noimageindex, notranslate">
+  <meta name="google" content="notranslate">
+  <meta name="ai" content="noai, noimageai">
+  <title>Privacy Policy — SchneiderOS QuickBooks Online Integration</title>
+  <style>
+:root { color-scheme: light; --bg: #f5f1e8; --panel: #fffaf2; --text: #1f1f1f; --muted: #5c5448; --accent: #8c4b1f; --border: #d9ccb8; --shadow: 0 18px 40px rgba(67,46,24,0.08); }
+* { box-sizing: border-box; }
+body { margin: 0; font-family: Georgia, "Times New Roman", serif; background: radial-gradient(circle at top left, rgba(207,171,120,0.2), transparent 28%), linear-gradient(180deg, #f0e5d4 0%, var(--bg) 45%, #efe6d7 100%); color: var(--text); line-height: 1.65; }
+main { max-width: 860px; margin: 0 auto; padding: 48px 20px 72px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 24px; box-shadow: var(--shadow); overflow: hidden; }
+.hero { padding: 40px 32px 28px; border-bottom: 1px solid var(--border); background: linear-gradient(135deg, rgba(140,75,31,0.08), rgba(140,75,31,0.02)), linear-gradient(180deg, rgba(255,255,255,0.75), rgba(255,250,242,0.95)); }
+.eyebrow { margin: 0 0 10px; font-size: 0.8rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); }
+h1 { margin: 0; font-size: clamp(2rem, 4vw, 3.4rem); line-height: 1.05; font-weight: 700; }
+.intro { margin: 18px 0 0; max-width: 60ch; color: var(--muted); font-size: 1.05rem; }
+.meta { margin-top: 18px; color: var(--muted); font-size: 0.95rem; }
+.content { padding: 12px 32px 36px; }
+section { padding-top: 18px; }
+h2 { margin: 0 0 10px; font-size: 1.2rem; color: var(--accent); }
+p { margin: 0 0 14px; }
+ul { margin: 0 0 14px 20px; padding: 0; }
+li + li { margin-top: 6px; }
+.contact { margin-top: 10px; padding: 18px 20px; background: rgba(140,75,31,0.06); border: 1px solid rgba(140,75,31,0.15); border-radius: 16px; }
+a { color: var(--accent); }
+@media (max-width: 640px) { .hero, .content { padding-left: 20px; padding-right: 20px; } main { padding-top: 24px; padding-bottom: 40px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <article class="card">
+      <div class="hero">
+        <p class="eyebrow">Privacy Notice</p>
+        <h1>SchneiderOS — QuickBooks Online Integration</h1>
+        <p class="intro">How the SchneiderOS QuickBooks Online integration accesses and handles accounting data. This is an internal tool, not a public-facing product.</p>
+        <p class="meta">Operated by Schneider Innovations Group, LLC · Effective May 29, 2026</p>
+      </div>
+      <div class="content">
+        <section>
+          <h2>1. Scope</h2>
+          <p>This notice describes how the <strong>SchneiderOS QuickBooks Online integration</strong> ("the Integration") accesses and processes data. The Integration is an internal tool operated by Schneider Innovations Group, LLC: it connects to QuickBooks Online (QBO) company files owned by Schneider Innovations Group, LLC and its affiliated entities to support our own internal finance and supply-chain operations. It is not offered to the public or to any third party.</p>
+        </section>
+        <section>
+          <h2>2. Information we access</h2>
+          <p>Via Intuit's QuickBooks Online API, and only for company files we have authorized, the Integration accesses accounting records, principally:</p>
+          <ul>
+            <li>Purchase and accounts-payable records (bills, purchase orders, vendor credits, vendors, items)</li>
+            <li>Bank/cash transactions and account balances</li>
+            <li>General ledger entries and company metadata (e.g. subscription status)</li>
+            <li>Exchange rates</li>
+          </ul>
+          <p>The Integration also stores the OAuth credentials (refresh tokens) needed to maintain the authorized connection. We do not access data for any company that has not been explicitly connected by an authorized administrator.</p>
+        </section>
+        <section>
+          <h2>3. How we use the data</h2>
+          <p>The data is used solely for our internal purposes, including cash-flow and liquidity planning, procurement and accounts-payable analysis, and intercompany reconciliation and group consolidation.</p>
+        </section>
+        <section>
+          <h2>4. What we do not do</h2>
+          <ul>
+            <li>We do not sell, rent, or share the data with third parties.</li>
+            <li>We do not use the data for advertising or for profiling of individuals.</li>
+            <li>We do not use the data for any purpose beyond the internal operations described above.</li>
+          </ul>
+        </section>
+        <section>
+          <h2>5. Storage and security</h2>
+          <ul>
+            <li>Accounting data is stored in access-controlled systems (object storage and a managed PostgreSQL database).</li>
+            <li>OAuth tokens are stored in an encrypted secrets manager and are never committed to source control.</li>
+            <li>Data in transit is protected with TLS; access is restricted to authorized personnel and service accounts under least-privilege controls.</li>
+          </ul>
+        </section>
+        <section>
+          <h2>6. Data retention</h2>
+          <p>Data is retained only as long as needed for the internal purposes above and to meet our accounting and legal recordkeeping obligations (generally up to 7 years). Connections can be revoked at any time, after which the token credentials are deleted.</p>
+        </section>
+        <section>
+          <h2>7. International data transfers</h2>
+          <p>Schneider Innovations Group, LLC operates entities in multiple jurisdictions (including the United States and the United Kingdom). Data may be processed and stored across these locations consistent with applicable data-protection laws.</p>
+        </section>
+        <section>
+          <h2>8. Intuit / QuickBooks compliance</h2>
+          <p>The Integration uses QuickBooks Online data strictly within the scope authorized by the connecting company and in accordance with Intuit's developer and data-use policies. Access can be revoked by disconnecting the app from within QuickBooks Online at any time.</p>
+        </section>
+        <section>
+          <h2>9. Data subject requests</h2>
+          <p>Because the Integration processes our own business accounting records, requests relating to this data should be directed to the contact below.</p>
+        </section>
+        <section>
+          <h2>10. Changes</h2>
+          <p>We may update this notice; the effective date above reflects the latest version.</p>
+        </section>
+        <div class="contact">
+          <p><strong>Schneider Innovations Group, LLC</strong><br>
+          Los Angeles, California, United States<br>
+          <a href="mailto:legal@schneiderinnovations.com">legal@schneiderinnovations.com</a></p>
+        </div>
+      </div>
+    </article>
+  </main>
+</body>
+</html>
