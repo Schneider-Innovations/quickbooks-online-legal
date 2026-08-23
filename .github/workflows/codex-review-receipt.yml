@@ -1,0 +1,349 @@
+name: Codex review receipt
+
+on:
+  workflow_call:
+    inputs:
+      reviewer_login:
+        description: Exact GitHub login that may supply Codex review evidence.
+        required: false
+        type: string
+        default: chatgpt-codex-connector
+      trigger_login:
+        description: GitHub user connected to the Codex subscription.
+        required: true
+        type: string
+      timeout_seconds:
+        description: Bounded wait for evidence. Must remain at least seven minutes.
+        required: false
+        type: number
+        default: 720
+      pr_number:
+        description: Optional PR number for an explicitly dispatched reconciliation run.
+        required: false
+        type: number
+        default: 0
+      base_branch:
+        description: Protected base branch expected for every reviewed PR.
+        required: false
+        type: string
+        default: main
+    secrets:
+      codex_trigger_token:
+        description: Fine-grained token limited to posting PR comments as trigger_login.
+        required: true
+
+# This workflow is intentionally invoked from a caller's pull_request_target
+# event. It never checks out or executes pull-request-controlled files.
+permissions:
+  checks: write
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  request:
+    name: Request exact-head review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      check_run_id: ${{ steps.receipt.outputs.check_run_id }}
+      head_sha: ${{ steps.request.outputs.head_sha }}
+      request_comment_url: ${{ steps.request.outputs.request_comment_url }}
+      started_at: ${{ steps.request.outputs.started_at }}
+      trigger: ${{ steps.request.outputs.trigger }}
+    steps:
+      - id: request
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+          TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+          TRIGGER_LOGIN: ${{ inputs.trigger_login }}
+        with:
+          github-token: ${{ secrets.codex_trigger_token }}
+          script: |
+            const requestedPrNumber = Number(process.env.PR_NUMBER);
+            const timeoutSeconds = Number(process.env.TIMEOUT_SECONDS);
+            const triggerLogin = process.env.TRIGGER_LOGIN;
+            const normalizedTriggerLogin = (triggerLogin || '').toLowerCase();
+            // Validate before performing external writes so invalid reusable-
+            // workflow inputs cannot leave a request or receipt behind.
+            if (!triggerLogin || !Number.isFinite(timeoutSeconds) || timeoutSeconds < 420 || timeoutSeconds > 900) {
+              core.setFailed('AI_REVIEW_CONFIGURATION_INVALID');
+              return;
+            }
+            const authenticatedUser = (await github.rest.users.getAuthenticated()).data;
+            if (authenticatedUser.login?.toLowerCase() !== normalizedTriggerLogin) {
+              core.setFailed('AI_REVIEW_TRIGGER_IDENTITY_MISMATCH');
+              return;
+            }
+            const pr = context.payload.pull_request || (
+              requestedPrNumber > 0
+                ? (await github.rest.pulls.get({ ...context.repo, pull_number: requestedPrNumber })).data
+                : null
+            );
+            if (!pr) {
+              core.setFailed('AI_REVIEW_PR_CONTEXT_REQUIRED');
+              return;
+            }
+            const { owner, repo } = context.repo;
+            if (pr.base.ref !== process.env.BASE_BRANCH || pr.head.repo?.full_name !== `${owner}/${repo}`) {
+              core.setFailed('AI_REVIEW_PR_SCOPE_FORBIDDEN');
+              return;
+            }
+            const headSha = pr.head.sha.toLowerCase();
+            const marker = `<!-- si-ai-review-request sha=${headSha} -->`;
+            const triggerMap = {
+              opened: 'opened',
+              reopened: 'reopened',
+              ready_for_review: 'ready_for_review',
+              synchronize: 'synchronize',
+            };
+            const trigger = triggerMap[context.payload.action] || 'reconciliation';
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: pr.number,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) =>
+              comment.user?.login?.toLowerCase() === normalizedTriggerLogin && comment.body?.includes(marker),
+            );
+            const request = existing || (await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: pr.number,
+              body: `${marker}\n\n@codex review\n\nAutomated Shadow review request for exact head \`${headSha}\`. Do not treat this comment as approval.`,
+            })).data;
+            if (!request.html_url || !request.created_at) {
+              core.setFailed('AI_REVIEW_REQUEST_METADATA_INVALID');
+              return;
+            }
+            if (request.user?.login?.toLowerCase() !== normalizedTriggerLogin) {
+              core.setFailed('AI_REVIEW_TRIGGER_IDENTITY_MISMATCH');
+              return;
+            }
+            core.setOutput('head_sha', headSha);
+            core.setOutput('request_comment_url', request.html_url);
+            // A reconciliation reuses the original SHA-specific request. Its
+            // evidence window must therefore begin at that request, not at the
+            // later reconciliation run, or a valid late response is discarded.
+            core.setOutput('started_at', request.created_at);
+            core.setOutput('trigger', trigger);
+
+      - id: receipt
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          HEAD_SHA: ${{ steps.request.outputs.head_sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        with:
+          script: |
+            const requestedPrNumber = Number(process.env.PR_NUMBER);
+            const pr = context.payload.pull_request || (
+              requestedPrNumber > 0
+                ? (await github.rest.pulls.get({ ...context.repo, pull_number: requestedPrNumber })).data
+                : null
+            );
+            const headSha = process.env.HEAD_SHA;
+            if (!pr || !/^[0-9a-f]{40}$/.test(headSha) || pr.head.sha.toLowerCase() !== headSha) {
+              core.setFailed('AI_REVIEW_RECEIPT_CONTEXT_INVALID');
+              return;
+            }
+            const { owner, repo } = context.repo;
+            const check = await github.rest.checks.create({
+              owner,
+              repo,
+              name: 'ai-review/receipt',
+              head_sha: headSha,
+              status: 'in_progress',
+              external_id: `ai-review-receipt:${pr.number}:${headSha}`,
+              output: {
+                title: 'Codex review receipt pending',
+                summary: `Shadow review requested for ${headSha}.`,
+              },
+            });
+            core.setOutput('check_run_id', String(check.data.id));
+
+  await-evidence:
+    name: Verify exact-head review evidence
+    needs: request
+    runs-on: ubuntu-24.04
+    timeout-minutes: 17
+    env:
+      CHECK_RUN_ID: ${{ needs.request.outputs.check_run_id }}
+      HEAD_SHA: ${{ needs.request.outputs.head_sha }}
+      REQUEST_COMMENT_URL: ${{ needs.request.outputs.request_comment_url }}
+      STARTED_AT: ${{ needs.request.outputs.started_at }}
+      TRIGGER: ${{ needs.request.outputs.trigger }}
+      REVIEWER_LOGIN: ${{ inputs.reviewer_login }}
+      TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+      BASE_BRANCH: ${{ inputs.base_branch }}
+    steps:
+      - id: receipt
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        with:
+          script: |
+            const fs = require('fs');
+            const requestedPrNumber = Number(process.env.PR_NUMBER);
+            const pr = context.payload.pull_request || (
+              requestedPrNumber > 0
+                ? (await github.rest.pulls.get({ ...context.repo, pull_number: requestedPrNumber })).data
+                : null
+            );
+            if (!pr) {
+              core.setFailed('AI_REVIEW_PR_CONTEXT_REQUIRED');
+              return;
+            }
+            const { owner, repo } = context.repo;
+            if (pr.base.ref !== process.env.BASE_BRANCH || pr.head.repo?.full_name !== `${owner}/${repo}`) {
+              core.setFailed('AI_REVIEW_PR_SCOPE_FORBIDDEN');
+              return;
+            }
+            const headSha = process.env.HEAD_SHA;
+            const reviewerLogin = process.env.REVIEWER_LOGIN;
+            const reviewerLogins = new Set([reviewerLogin]);
+            if (reviewerLogin === 'chatgpt-codex-connector') {
+              reviewerLogins.add('chatgpt-codex-connector[bot]');
+            }
+            const startedAt = process.env.STARTED_AT;
+            const startedAtMilliseconds = Date.parse(startedAt);
+            const timeoutSeconds = Number(process.env.TIMEOUT_SECONDS);
+            if (
+              !/^[0-9a-f]{40}$/.test(headSha) ||
+              !Number.isFinite(startedAtMilliseconds) ||
+              !Number.isFinite(timeoutSeconds) ||
+              timeoutSeconds < 420 ||
+              timeoutSeconds > 900
+            ) {
+              core.setFailed('AI_REVIEW_CONFIGURATION_INVALID');
+              return;
+            }
+            let evidence = null;
+            let staleSha = null;
+            let unavailableReason = null;
+            const deadline = Date.now() + timeoutSeconds * 1000;
+            let delaySeconds = 0;
+            while (true) {
+              if (delaySeconds > 0) {
+                const remainingMilliseconds = deadline - Date.now();
+                if (remainingMilliseconds <= 0) break;
+                await new Promise((resolve) => setTimeout(
+                  resolve,
+                  Math.min(delaySeconds * 1000, remainingMilliseconds),
+                ));
+              }
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: pr.number,
+                per_page: 100,
+              });
+              const reviews = await github.paginate(github.rest.pulls.listReviews, {
+                owner,
+                repo,
+                pull_number: pr.number,
+                per_page: 100,
+              });
+              const evidenceBodies = [
+                ...comments.map((comment) => ({
+                  body: comment.body || '',
+                  createdAt: comment.created_at,
+                  login: comment.user?.login,
+                  url: comment.html_url,
+                })),
+                ...reviews.map((review) => ({
+                  body: review.body || '',
+                  createdAt: review.submitted_at,
+                  login: review.user?.login,
+                  url: review.html_url,
+                })),
+              ].filter((candidate) =>
+                reviewerLogins.has(candidate.login) &&
+                candidate.createdAt &&
+                Date.parse(candidate.createdAt) >= startedAtMilliseconds,
+              );
+              for (const candidate of evidenceBodies) {
+                const body = candidate.body;
+                const match = body.match(/Reviewed commit:\*?\*?\s*`?([0-9a-f]{7,40})`?/i);
+                if (match) {
+                  let reviewedSha = match[1].toLowerCase();
+                  if (reviewedSha.length < 40) {
+                    try {
+                      reviewedSha = (await github.rest.repos.getCommit({ owner, repo, ref: reviewedSha })).data.sha.toLowerCase();
+                    } catch {
+                      unavailableReason = 'reviewer_evidence_unparseable';
+                      continue;
+                    }
+                  }
+                  if (reviewedSha === headSha) {
+                    evidence = { url: candidate.url, sha: reviewedSha };
+                    break;
+                  }
+                  staleSha = reviewedSha;
+                  continue;
+                }
+                // A substantive review can legitimately mention a rate limit.
+                // Treat the availability wording as service evidence only when
+                // the Connector did not identify a reviewed commit.
+                if (/usage limits|rate limit|limit.*review/i.test(body)) {
+                  unavailableReason = 'reviewer_unavailable';
+                }
+              }
+              if (evidence) break;
+              const remainingSeconds = Math.floor((deadline - Date.now()) / 1000);
+              if (remainingSeconds <= 0) break;
+              delaySeconds = delaySeconds === 0
+                ? 60
+                : Math.min(delaySeconds * 2, 300, remainingSeconds);
+            }
+            const completedAt = new Date().toISOString();
+            const status = evidence ? 'passed' : staleSha ? 'stale' : 'unavailable';
+            const reasonCodes = evidence ? [] : [staleSha ? 'reviewed_sha_stale' : (unavailableReason || 'reviewer_timeout')];
+            const receipt = {
+              schema_version: '1.0',
+              review_run_id: `ai-review:${context.runId}:${process.env.GITHUB_RUN_ATTEMPT || '1'}`,
+              repository: `${owner}/${repo}`,
+              pr_number: pr.number,
+              head_sha: headSha,
+              reviewed_sha: evidence?.sha || staleSha,
+              mode: 'shadow',
+              trigger: process.env.TRIGGER,
+              status,
+              decision: evidence ? 'reviewed_current_head' : 'not_ready',
+              reason_codes: reasonCodes,
+              reviewer: { provider: 'codex_github_connector', login: reviewerLogin },
+              request_comment_url: process.env.REQUEST_COMMENT_URL,
+              review_evidence_url: evidence?.url || null,
+              started_at: startedAt,
+              completed_at: completedAt,
+            };
+            fs.writeFileSync('ai-review-receipt.json', `${JSON.stringify(receipt, null, 2)}\n`);
+            const conclusion = evidence ? 'success' : 'failure';
+            await github.rest.checks.update({
+              owner,
+              repo,
+              check_run_id: Number(process.env.CHECK_RUN_ID),
+              status: 'completed',
+              conclusion,
+              completed_at: completedAt,
+              output: {
+                title: evidence ? 'Codex reviewed current head' : 'Codex review receipt not ready',
+                summary: evidence
+                  ? `Evidence: ${evidence.url}`
+                  : `Fail-closed Shadow result: ${reasonCodes.join(', ')}. Current head: ${headSha}.`,
+              },
+            });
+            core.setOutput('status', status);
+            if (!evidence) {
+              core.setFailed(`AI_REVIEW_NOT_READY:${reasonCodes.join(',')}`);
+            }
+      - name: Upload sanitized review receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ai-review-receipt-${{ github.event.pull_request.number }}-${{ needs.request.outputs.head_sha }}
+          path: ai-review-receipt.json
+          if-no-files-found: error
+          retention-days: 14
+
