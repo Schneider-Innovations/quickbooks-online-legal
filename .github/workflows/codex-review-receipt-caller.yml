@@ -29,7 +29,10 @@ jobs:
       contents: read
       issues: read
       pull-requests: read
-    uses: Schneider-Innovations/snd-quality-gate/.github/workflows/codex-review-receipt.yml@bff209397cd398364762f151a08f201bf42e81b9
+    # Public repositories cannot call a reusable workflow hosted in a private
+    # repository. This base-owned local copy is functionally aligned with the
+    # pinned central workflow and never executes pull-request code.
+    uses: ./.github/workflows/codex-review-receipt.yml
     with:
       reviewer_login: chatgpt-codex-connector
       trigger_login: mercury1231
