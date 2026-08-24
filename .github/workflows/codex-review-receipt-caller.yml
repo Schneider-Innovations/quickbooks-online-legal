@@ -2,42 +2,31 @@ name: Codex exact-head review request
 
 on:
   pull_request_target:
-    types:
-      - opened
-      - reopened
-      - synchronize
-      - ready_for_review
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Exact open pull request number to reconcile from protected main.
+        required: true
+        type: number
 
-# This caller is resolved from the protected base branch. It never checks out
-# or executes pull-request-controlled code. The central workflow is pinned to
-# an immutable commit and fails closed when exact-head evidence is unavailable.
 permissions:
   contents: read
 
 concurrency:
-  group: codex-review-receipt-${{ github.event.pull_request.number }}
+  group: codex-review-receipt-${{ inputs.pr_number || github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   request-and-verify-review:
     if: >-
-      github.event.pull_request.base.ref == 'main' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.draft == false
+      (github.event_name == 'pull_request_target' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.pr_number > 0)
     permissions:
       checks: write
       contents: read
-      issues: read
       pull-requests: read
-    # Public repositories cannot call a reusable workflow hosted in a private
-    # repository. This base-owned local copy is functionally aligned with the
-    # pinned central workflow and never executes pull-request code.
     uses: ./.github/workflows/codex-review-receipt.yml
     with:
-      reviewer_login: chatgpt-codex-connector
-      trigger_login: mercury1231
-      timeout_seconds: 720
+      pr_number: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || 0 }}
       base_branch: main
-    secrets:
-      codex_trigger_token: ${{ secrets.CODEX_REVIEW_TRIGGER_TOKEN }}
-
