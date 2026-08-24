@@ -55,6 +55,8 @@ jobs:
             }
             const { owner, repo } = context.repo;
             if (
+              pr.state !== 'open' ||
+              pr.draft === true ||
               pr.base.ref !== process.env.BASE_BRANCH ||
               pr.head.repo?.full_name !== `${owner}/${repo}` ||
               !/^[0-9a-f]{40}$/i.test(pr.base.sha) ||
@@ -102,10 +104,15 @@ jobs:
           mkdir "$temporary"
           trap 'rm -rf -- "$temporary"' EXIT
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
-          git diff --no-ext-diff --binary "$BASE_SHA" "$HEAD_SHA" -- > "$temporary/diff.patch"
+          merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          test -n "$merge_base"
+          test "$merge_base" = "$(git rev-parse "$merge_base")"
+          git merge-base --is-ancestor "$merge_base" "$BASE_SHA"
+          git merge-base --is-ancestor "$merge_base" "$HEAD_SHA"
+          git diff --no-ext-diff --binary "$merge_base" "$HEAD_SHA" -- > "$temporary/diff.patch"
           git ls-files -z | tar --create --no-recursion --verbatim-files-from --null --files-from=- --gzip --file="$temporary/source.tar.gz"
-          printf '{"request_id":"%s","repository":"%s","pr_number":%s,"head_sha":"%s","base_sha":"%s"}\n' \
-            "$REQUEST_ID" "$REPOSITORY" "$PR_NUMBER" "$HEAD_SHA" "$BASE_SHA" > "$temporary/request.json"
+          printf '{"request_id":"%s","repository":"%s","pr_number":%s,"head_sha":"%s","base_sha":"%s","merge_base_sha":"%s"}\n' \
+            "$REQUEST_ID" "$REPOSITORY" "$PR_NUMBER" "$HEAD_SHA" "$BASE_SHA" "$merge_base" > "$temporary/request.json"
           chmod 0640 "$temporary/diff.patch" "$temporary/source.tar.gz" "$temporary/request.json"
           mv "$temporary" "$target"
           trap - EXIT
