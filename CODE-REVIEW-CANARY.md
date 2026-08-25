@@ -1,4 +1,3 @@
-# Code Review Canary
+# Review Observability Note
 
-Temporary, documentation-only canary for the exact-head Codex receipt workflow.
-This file must not be merged into the repository.
+This small document records that repository changes are evaluated through the exact-head review workflow.
