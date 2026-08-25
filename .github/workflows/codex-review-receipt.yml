@@ -102,6 +102,11 @@ jobs:
           test ! -e "$temporary"
           test ! -e "$target"
           mkdir "$temporary"
+          # The review agent atomically moves this directory into its private
+          # claim queue. Moving a directory changes its `..` entry, so the
+          # shared service group needs write permission on the directory
+          # itself, not merely on its parent.
+          chmod 2770 "$temporary"
           trap 'rm -rf -- "$temporary"' EXIT
           test "$(git rev-parse HEAD)" = "$HEAD_SHA"
           merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
