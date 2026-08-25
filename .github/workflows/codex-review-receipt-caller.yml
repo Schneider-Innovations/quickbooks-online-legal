@@ -27,17 +27,12 @@ jobs:
     permissions:
       checks: write
       contents: read
-      issues: read
       pull-requests: read
     # Public repositories cannot call a reusable workflow hosted in a private
-    # repository. This base-owned local copy is functionally aligned with the
-    # pinned central workflow and never executes pull-request code.
-    uses: ./.github/workflows/codex-review-receipt.yml
+    # repository. This base-owned local CLI receipt workflow never executes
+    # pull-request-controlled code and carries no Connector trigger token.
+    uses: ./.github/workflows/codex-cli-review-receipt.yml
     with:
-      reviewer_login: chatgpt-codex-connector
-      trigger_login: mercury1231
-      timeout_seconds: 720
+      pr_number: 0
       base_branch: main
-    secrets:
-      codex_trigger_token: ${{ secrets.CODEX_REVIEW_TRIGGER_TOKEN }}
 
