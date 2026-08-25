@@ -278,3 +278,20 @@ jobs:
             }
             fs.rmSync(target, { recursive: true, force: true });
 
+      - name: Remove consumed review receipt
+        if: always() && needs.prepare-cli-review.outputs.request_id != ''
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          REQUEST_ID: ${{ needs.prepare-cli-review.outputs.request_id }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const root = path.resolve('/var/lib/codex-review-bridge/outgoing');
+            const target = path.resolve(root, `${process.env.REQUEST_ID}.json`);
+            if (!target.startsWith(`${root}${path.sep}`)) {
+              core.setFailed('AI_CLI_REVIEW_RECEIPT_CLEANUP_PATH_INVALID');
+              return;
+            }
+            fs.rmSync(target, { force: true });
+
