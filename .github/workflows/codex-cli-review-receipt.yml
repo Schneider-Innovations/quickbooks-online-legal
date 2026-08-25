@@ -78,6 +78,8 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           ref: ${{ steps.context.outputs.head_sha }}
+          # Fetch history while checkout holds its short-lived repository token.
+          # That action removes the token before the untrusted snapshot is read.
           fetch-depth: 0
           persist-credentials: false
           submodules: false
@@ -116,6 +118,8 @@ jobs:
           git diff --no-ext-diff --binary "$merge_base" "$HEAD_SHA" -- > "$temporary/diff.patch"
           git ls-files -z | tar --create --no-recursion --verbatim-files-from --null --files-from=- --gzip --file="$temporary/source.tar.gz"
           git diff --no-ext-diff --name-only -z "$merge_base" "$HEAD_SHA" -- > "$temporary/changed-files.z"
+          # Node is supplied by the pinned GitHub actions. It avoids shell JSON
+          # interpolation and binds the review contract to the exact diff.
           node - "$temporary/changed-files.z" "$temporary/request.json" <<'NODE'
           const fs = require('fs');
           const [changedFilesPath, requestPath] = process.argv.slice(2);
@@ -157,8 +161,11 @@ jobs:
                 title: 'Codex CLI review pending',
                 summary: `Shadow CLI review requested for ${process.env.HEAD_SHA}.`,
                 text: JSON.stringify({
-                  schema_version: '1.0', mode: 'shadow', request_id: process.env.REQUEST_ID,
-                  head_sha: process.env.HEAD_SHA, status: 'pending',
+                  schema_version: '1.0',
+                  mode: 'shadow',
+                  request_id: process.env.REQUEST_ID,
+                  head_sha: process.env.HEAD_SHA,
+                  status: 'pending',
                 }, null, 2),
               },
             });
@@ -224,42 +231,112 @@ jobs:
             const expectedHead = process.env.HEAD_SHA;
             const expectedBase = process.env.BASE_SHA;
             const expectedMergeBase = process.env.MERGE_BASE_SHA;
-            const expectedPolicyDigest = 'da487b1651657e1bf6e0c45642d51f166ce073cdc81527fd361446255b05a469';
+            // This is sha256("review-result-schema/v2\\0" + the approved
+            // base-owned Codex prompt).  It is deliberately pinned here, in
+            // the workflow trust root, rather than merely checking that an
+            // untrusted receipt has a SHA-shaped value.  Changing the agent
+            // prompt or result contract must therefore be accompanied by a
+            // reviewed control-plane change.
+            const expectedPolicyDigest = '5999c77487d11a8aff899dcc33153a9faca5708c6b0031cbf7e0130b88871cc9';
             const changed = await github.paginate(github.rest.pulls.listFiles, {
-              ...context.repo, pull_number: Number(process.env.PR_NUMBER), per_page: 100,
+              ...context.repo,
+              pull_number: Number(process.env.PR_NUMBER),
+              per_page: 100,
             });
             const expectedChangedFiles = changed.map((file) => file.filename).sort();
             const isStringArray = (value) => Array.isArray(value) && value.every((item) => typeof item === 'string' && item.length > 0 && item.length <= 512);
-            const sameSortedStrings = (value, expected) => isStringArray(value) && [...value].sort().every((item, index) => item === expected[index]) && value.length === expected.length;
-            const validOmissions = (value, reviewed) => Array.isArray(value) && value.every((item) => item && typeof item === 'object' && Object.keys(item).length === 2 && typeof item.path === 'string' && expectedChangedFiles.includes(item.path) && !reviewed.includes(item.path) && typeof item.reason === 'string' && item.reason.length > 0 && item.reason.length <= 240);
-            const validFindings = (value) => Array.isArray(value) && value.length <= 25 && value.every((item) => item && typeof item === 'object' && Object.keys(item).length === 5 && ['severity', 'path', 'line', 'title', 'explanation'].every((key) => Object.hasOwn(item, key)) && ['critical', 'high', 'medium', 'low'].includes(item.severity) && typeof item.path === 'string' && expectedChangedFiles.includes(item.path) && Number.isInteger(item.line) && item.line > 0 && item.line <= 1_000_000 && typeof item.title === 'string' && item.title.length > 0 && item.title.length <= 240 && typeof item.explanation === 'string' && item.explanation.length > 0 && item.explanation.length <= 2000);
-            const coverageComplete = receipt && sameSortedStrings(receipt.changed_files, expectedChangedFiles) && sameSortedStrings(receipt.reviewed_files, expectedChangedFiles) && Array.isArray(receipt.omitted_files) && receipt.omitted_files.length === 0;
+            const sameSortedStrings = (value, expected) => isStringArray(value) &&
+              [...value].sort().every((item, index) => item === expected[index]) && value.length === expected.length;
+            const validOmissions = (value, reviewed) => Array.isArray(value) && value.every((item) =>
+              item && typeof item === 'object' &&
+              Object.keys(item).length === 2 &&
+              typeof item.path === 'string' && expectedChangedFiles.includes(item.path) && !reviewed.includes(item.path) &&
+              typeof item.reason === 'string' && item.reason.length > 0 && item.reason.length <= 240,
+            );
+            const validFindings = (value) => Array.isArray(value) && value.length <= 25 && value.every((item) =>
+              item && typeof item === 'object' &&
+              Object.keys(item).length === 5 &&
+              ['severity', 'path', 'line', 'title', 'explanation'].every((key) => Object.hasOwn(item, key)) &&
+              ['critical', 'high', 'medium', 'low'].includes(item.severity) &&
+              typeof item.path === 'string' && expectedChangedFiles.includes(item.path) &&
+              Number.isInteger(item.line) && item.line > 0 && item.line <= 1_000_000 &&
+              typeof item.title === 'string' && item.title.length > 0 && item.title.length <= 240 &&
+              typeof item.explanation === 'string' && item.explanation.length > 0 && item.explanation.length <= 2000,
+            );
+            const coverageComplete = receipt && sameSortedStrings(receipt.changed_files, expectedChangedFiles) &&
+              sameSortedStrings(receipt.reviewed_files, expectedChangedFiles) &&
+              Array.isArray(receipt.omitted_files) && receipt.omitted_files.length === 0;
             const valid = receipt &&
-              receipt.schema_version === '1.0' && receipt.request_id === requestId && receipt.pr_number === Number(process.env.PR_NUMBER) && receipt.head_sha === expectedHead && receipt.base_sha === expectedBase && receipt.merge_base_sha === expectedMergeBase && receipt.status === 'completed' && ['PASS', 'BLOCK', 'INCONCLUSIVE'].includes(receipt.decision) && typeof receipt.summary === 'string' && receipt.summary.length > 0 && receipt.summary.length <= 2000 && typeof receipt.analysis_complete === 'boolean' && isStringArray(receipt.changed_files) && isStringArray(receipt.reviewed_files) && validOmissions(receipt.omitted_files, receipt.reviewed_files) && validFindings(receipt.findings) && receipt.policy_digest === expectedPolicyDigest && typeof receipt.runtime === 'object' && receipt.runtime !== null && Object.keys(receipt.runtime).length === 2 && Object.hasOwn(receipt.runtime, 'harness') && Object.hasOwn(receipt.runtime, 'version') && typeof receipt.runtime.harness === 'string' && receipt.runtime.harness.length > 0 && typeof receipt.runtime.version === 'string' && receipt.runtime.version.length > 0;
+              receipt.schema_version === '1.0' &&
+              receipt.request_id === requestId &&
+              receipt.pr_number === Number(process.env.PR_NUMBER) &&
+              receipt.head_sha === expectedHead &&
+              receipt.base_sha === expectedBase &&
+              receipt.merge_base_sha === expectedMergeBase &&
+              receipt.status === 'completed' &&
+              ['PASS', 'BLOCK', 'INCONCLUSIVE'].includes(receipt.decision) &&
+              typeof receipt.summary === 'string' &&
+              receipt.summary.length > 0 && receipt.summary.length <= 2000 &&
+              typeof receipt.analysis_complete === 'boolean' &&
+              isStringArray(receipt.changed_files) &&
+              isStringArray(receipt.reviewed_files) &&
+              validOmissions(receipt.omitted_files, receipt.reviewed_files) &&
+              validFindings(receipt.findings) &&
+              receipt.policy_digest === expectedPolicyDigest &&
+              typeof receipt.runtime === 'object' && receipt.runtime !== null &&
+              Object.keys(receipt.runtime).length === 2 &&
+              Object.hasOwn(receipt.runtime, 'harness') && Object.hasOwn(receipt.runtime, 'version') &&
+              typeof receipt.runtime.harness === 'string' && receipt.runtime.harness.length > 0 &&
+              typeof receipt.runtime.version === 'string' && receipt.runtime.version.length > 0;
             const clear = valid && receipt.decision === 'PASS' && receipt.analysis_complete === true && coverageComplete && receipt.findings.length === 0;
             let conclusion = clear ? 'success' : 'failure';
-            let reason = !receipt ? 'result_missing_or_malformed' : !valid ? 'result_contract_invalid' : !clear && receipt.decision === 'PASS' ? 'review_coverage_incomplete' : `decision_${receipt.decision.toLowerCase()}`;
+            let reason = !receipt
+              ? 'result_missing_or_malformed'
+              : !valid
+                ? 'result_contract_invalid'
+                : !clear && receipt.decision === 'PASS'
+                  ? 'review_coverage_incomplete'
+                  : `decision_${receipt.decision.toLowerCase()}`;
             let output = valid ? receipt : {
-              schema_version: '1.0', mode: 'shadow', request_id: requestId,
-              head_sha: expectedHead, status: 'unavailable', reason_code: reason,
+              schema_version: '1.0',
+              mode: 'shadow',
+              request_id: requestId,
+              head_sha: expectedHead,
+              status: 'unavailable',
+              reason_code: reason,
             };
             let receiptText = JSON.stringify(output);
+            // GitHub Checks accepts at most 65,535 characters. Keep a buffer
+            // for transport encoding and fail closed rather than losing a
+            // completed Check after a valid local model result.
             if (valid && (receiptText.length > 60_000 || Buffer.byteLength(receiptText, 'utf8') > 60_000)) {
-              conclusion = 'failure'; reason = 'result_too_large';
-              output = { schema_version: '1.0', mode: 'shadow', request_id: requestId,
-                head_sha: expectedHead, status: 'unavailable', reason_code: reason };
+              conclusion = 'failure';
+              reason = 'result_too_large';
+              output = {
+                schema_version: '1.0',
+                mode: 'shadow',
+                request_id: requestId,
+                head_sha: expectedHead,
+                status: 'unavailable',
+                reason_code: reason,
+              };
               receiptText = JSON.stringify(output);
             }
             await github.rest.checks.update({
-              ...context.repo, check_run_id: Number(process.env.CHECK_RUN_ID), status: 'completed',
-              conclusion, completed_at: new Date().toISOString(),
+              ...context.repo,
+              check_run_id: Number(process.env.CHECK_RUN_ID),
+              status: 'completed',
+              conclusion,
+              completed_at: new Date().toISOString(),
               output: {
                 title: conclusion === 'success' ? 'Codex CLI reviewed current head' : 'Codex CLI review receipt not ready',
                 summary: conclusion === 'success' ? output.summary : `Fail-closed Shadow result: ${reason}.`,
                 text: receiptText,
               },
             });
-            if (conclusion !== 'success') core.setFailed(`AI_CLI_REVIEW_NOT_READY:${reason}`);
+            if (conclusion !== 'success') {
+              core.setFailed(`AI_CLI_REVIEW_NOT_READY:${reason}`);
+            }
 
       - name: Remove submitted snapshot
         if: always()
@@ -279,7 +356,7 @@ jobs:
             fs.rmSync(target, { recursive: true, force: true });
 
       - name: Remove consumed review receipt
-        if: always() && needs.prepare-cli-review.outputs.request_id != ''
+        if: always()
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
           REQUEST_ID: ${{ needs.prepare-cli-review.outputs.request_id }}
@@ -294,4 +371,3 @@ jobs:
               return;
             }
             fs.rmSync(target, { force: true });
-
