@@ -189,7 +189,7 @@ jobs:
           # ``MERGE_SHA`` is a verified base/head merge preview. The model
           # receives the exact changes this strict-gate Check would merge and
           # a full snapshot of that resulting tree.
-          git diff --no-ext-diff --binary "$BASE_SHA" "$MERGE_SHA" -- > "$temporary/diff.patch"
+          git diff --no-ext-diff --no-textconv --binary "$BASE_SHA" "$MERGE_SHA" -- > "$temporary/diff.patch"
           source_root="$temporary/source"
           mkdir -- "$source_root"
           # Do not use git archive: it honors export-ignore and could omit a
@@ -205,33 +205,21 @@ jobs:
             echo "candidate snapshot contains symlink" >&2
             exit 1
           fi
-          # A deleted file has no merge-preview bytes to snapshot. Keep the
-          # path in the manifest and give the isolated reviewer an explicit,
-          # deterministic marker; diff.patch retains the deleted source.
-          git diff --name-only --diff-filter=D -z "$BASE_SHA" "$MERGE_SHA" | while IFS= read -r -d '' deleted_path; do
-            case "$deleted_path" in
-              ''|/*|.|..|../*|*/../*|*/.|*/..)
-                echo "unsafe deleted path" >&2
-                exit 1
-                ;;
-            esac
-            marker_path="$source_root/$deleted_path"
-            test ! -e "$marker_path"
-            mkdir -p -- "$(dirname -- "$marker_path")"
-            printf '%s\n' 'Deleted from verified merge preview; review diff.patch for the prior content and deletion.' > "$marker_path"
-          done
+          # Deleted paths intentionally have no placeholder inside the merged
+          # source tree. Their complete prior content and deletion are retained
+          # in diff.patch, avoiding file-to-directory marker collisions.
           (
             cd "$source_root"
             find . -type f -print0 | tar --create --no-recursion --verbatim-files-from --null --files-from=- --gzip --file="$temporary/source.tar.gz"
           )
-          git diff --no-ext-diff --name-only -z "$BASE_SHA" "$MERGE_SHA" -- > "$temporary/changed-files.z"
+          git diff --no-ext-diff --no-textconv --name-only -z "$BASE_SHA" "$MERGE_SHA" -- > "$temporary/changed-files.z"
           # Node is supplied by the pinned GitHub actions. It avoids shell JSON
           # interpolation and binds the review contract to the exact diff.
           node - "$temporary/changed-files.z" "$temporary/request.json" <<'NODE'
           const fs = require('fs');
           const [changedFilesPath, requestPath] = process.argv.slice(2);
           const changedFiles = fs.readFileSync(changedFilesPath).toString('utf8').split('\0').filter(Boolean);
-          if (!changedFiles.length || new Set(changedFiles).size !== changedFiles.length) {
+          if (new Set(changedFiles).size !== changedFiles.length) {
             throw new Error('AI_CLI_REVIEW_CHANGED_FILES_INVALID');
           }
           const request = {
@@ -272,14 +260,29 @@ jobs:
                 status: 'pending',
               }, null, 2),
             };
-            const headCheck = await github.rest.checks.create({
-              ...context.repo,
-              name: 'ai-review/receipt',
-              head_sha: process.env.HEAD_SHA,
-              status: 'in_progress',
-              external_id: `ai-cli-review:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}`,
-              output,
-            });
+            const invalidationId = `ai-review-invalidated:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}`;
+            const existingChecks = await github.paginate(
+              github.rest.checks.listForRef,
+              { ...context.repo, ref: process.env.HEAD_SHA, per_page: 100 },
+            );
+            const invalidation = existingChecks.find((check) =>
+              check.name === 'ai-review/receipt' && check.external_id === invalidationId,
+            );
+            const headCheck = invalidation
+              ? await github.rest.checks.update({
+                  ...context.repo,
+                  check_run_id: invalidation.id,
+                  status: 'in_progress',
+                  output,
+                })
+              : await github.rest.checks.create({
+                  ...context.repo,
+                  name: 'ai-review/receipt',
+                  head_sha: process.env.HEAD_SHA,
+                  status: 'in_progress',
+                  external_id: `ai-cli-review:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}`,
+                  output,
+                });
             let mergeCheck;
             try {
               mergeCheck = await github.rest.checks.create({
@@ -384,16 +387,20 @@ jobs:
               per_page: 100,
             });
             const expectedChangedFiles = changed.map((file) => file.filename).sort();
+            const highRiskPaths = changed.flatMap((file) =>
+              [file.filename, file.previous_filename].filter(Boolean),
+            );
             const highRiskPatterns = [
               /^\.github\/workflows\//,
               /^(config|scripts)\/ci-runners\//,
               /(^|\/)(auth|authorization|permissions?|rulesets?|secrets?|security)(\/|[-_.])/i,
               /(^|\/)(deploy|deployment|production|terraform|tofu)(\/|[-_.])/i,
+              /(^|\/)_?middleware\.[cm]?[jt]sx?$/i,
               /\.(tf|tfvars)$/i,
             ];
-            const highRiskFiles = expectedChangedFiles.filter((file) =>
+            const highRiskFiles = [...new Set(highRiskPaths.filter((file) =>
               highRiskPatterns.some((pattern) => pattern.test(file)),
-            );
+            ))].sort();
             const isStringArray = (value) => Array.isArray(value) && value.every((item) => typeof item === 'string' && item.length > 0 && item.length <= 512);
             const sameSortedStrings = (value, expected) => isStringArray(value) &&
               [...value].sort().every((item, index) => item === expected[index]) && value.length === expected.length;
@@ -676,9 +683,10 @@ jobs:
             let evidenceUrl = null;
             let reviewedSha = null;
             if (Number.isFinite(startedAtMilliseconds)) {
-              const deadline = Date.now() + 720 * 1000;
+              let deadline = Date.now() + 720 * 1000;
               let delaySeconds = 0;
               let cleanFirstSeenAt = null;
+              let confirmationExtended = false;
               let formatFirstSeenAt = null;
               connectorStatus = 'unavailable';
               connectorReason = 'connector_timeout';
@@ -707,24 +715,26 @@ jobs:
                   github.rest.pulls.listReviewComments,
                   { owner, repo, pull_number: prNumber, per_page: 100 },
                 );
-                const reviewBodies = new Map();
-                for (const review of reviews) {
-                  reviewBodies.set(review.id, {
+                const reviewCandidates = reviews.map((review) => ({
                     body: review.body || '',
                     createdAt: review.submitted_at,
                     login: review.user?.login?.toLowerCase(),
                     url: review.html_url,
+                    reviewedSha: review.commit_id,
                     inlineFindingUrls: [],
-                  });
-                }
+                  }));
+                const inlineCandidates = [];
                 for (const comment of reviewComments) {
-                  const parent = reviewBodies.get(comment.pull_request_review_id);
-                  if (
-                    parent &&
-                    reviewerLogins.has(comment.user?.login?.toLowerCase())
-                  ) {
-                    parent.body += `\n${comment.body || ''}`;
-                    parent.inlineFindingUrls.push(comment.html_url);
+                  const login = comment.user?.login?.toLowerCase();
+                  if (reviewerLogins.has(login)) {
+                    inlineCandidates.push({
+                      body: comment.body || '',
+                      createdAt: comment.created_at,
+                      login,
+                      url: comment.html_url,
+                      reviewedSha: comment.commit_id,
+                      inlineFindingUrls: [comment.html_url],
+                    });
                   }
                 }
                 const candidates = [
@@ -732,7 +742,8 @@ jobs:
                     body: item.body || '', createdAt: item.created_at,
                     login: item.user?.login?.toLowerCase(), url: item.html_url,
                   })),
-                  ...reviewBodies.values(),
+                  ...reviewCandidates,
+                  ...inlineCandidates,
                 ].filter((item) =>
                   reviewerLogins.has(item.login) && item.createdAt &&
                   Date.parse(item.createdAt) >= startedAtMilliseconds,
@@ -743,13 +754,13 @@ jobs:
                   const match = candidate.body.match(
                     /Reviewed commit:\*?\*?\s*`?([0-9a-f]{7,40})`?/i,
                   );
-                  if (!match) {
+                  if (!candidate.reviewedSha && !match) {
                     if (/usage limits|rate limit|limit.*review/i.test(candidate.body)) {
                       connectorReason = 'connector_unavailable';
                     }
                     continue;
                   }
-                  reviewedSha = match[1].toLowerCase();
+                  reviewedSha = (candidate.reviewedSha || match[1]).toLowerCase();
                   if (reviewedSha.length < 40) {
                     try {
                       reviewedSha = (await github.rest.repos.getCommit({
@@ -801,6 +812,10 @@ jobs:
                   evidenceUrl = clean?.url || process.env.REQUEST_COMMENT_URL;
                   reviewedSha = headSha;
                   cleanFirstSeenAt ||= Date.now();
+                  if (!confirmationExtended && deadline - cleanFirstSeenAt < 45 * 1000) {
+                    deadline = cleanFirstSeenAt + 45 * 1000;
+                    confirmationExtended = true;
+                  }
                   if (Date.now() - cleanFirstSeenAt >= 30 * 1000) {
                     connectorStatus = 'passed';
                     connectorReason = 'connector_clean';
