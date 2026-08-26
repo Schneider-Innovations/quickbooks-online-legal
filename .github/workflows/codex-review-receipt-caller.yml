@@ -3,36 +3,163 @@ name: Codex exact-head review request
 on:
   pull_request_target:
     types:
-      - opened
+      - labeled
+      - unlabeled
       - reopened
       - synchronize
-      - ready_for_review
+      - converted_to_draft
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Exact open pull request number to reconcile from protected main.
+        required: true
+        type: number
 
 # This caller is resolved from the protected base branch. It never checks out
-# or executes pull-request-controlled code. The central workflow is pinned to
-# an immutable commit and fails closed when exact-head evidence is unavailable.
+# or executes pull-request-controlled code. The reusable workflow snapshots the
+# same-repository PR for the isolated local Codex CLI service; it receives no
+# subscription credential or GitHub write token.
 permissions:
   contents: read
 
 concurrency:
-  group: codex-review-receipt-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: codex-review-receipt-${{ inputs.pr_number || github.event.pull_request.number }}
+  cancel-in-progress: >-
+    ${{
+      github.event_name == 'workflow_dispatch' ||
+      github.event.action == 'reopened' ||
+      github.event.action == 'synchronize' ||
+      github.event.action == 'converted_to_draft' ||
+      (github.event.action == 'unlabeled' && github.event.label.name == 'ready-for-final-review')
+    }}
 
 jobs:
-  request-and-verify-review:
+  invalidate-review:
     if: >-
+      github.event_name == 'pull_request_target' &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.draft == false
+      (
+        github.event.action == 'reopened' ||
+        github.event.action == 'synchronize' ||
+        github.event.action == 'converted_to_draft' ||
+        (github.event.action == 'unlabeled' && github.event.label.name == 'ready-for-final-review') ||
+        (github.event.action == 'labeled' &&
+         github.event.label.name == 'ready-for-final-review' &&
+         !(github.event.pull_request.draft == false &&
+           github.actor == (vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231')))
+      )
+    runs-on: ${{ fromJSON(vars.CI_GENERAL_RUNS_ON || vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
     permissions:
       checks: write
       contents: read
+      issues: read
       pull-requests: read
-    # Public repositories cannot call a reusable workflow hosted in a private
-    # repository. This base-owned local CLI receipt workflow never executes
-    # pull-request-controlled code and carries no Connector trigger token.
+    steps:
+      # Organization policy keeps GITHUB_TOKEN read-only. This narrow token is
+      # repository-scoped and used only to remove a stale readiness label; no
+      # pull-request code is checked out or executed by this base-owned job.
+      - name: Remove stale final-head review label
+        id: remove-stale-label
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          EXPECTED_TOKEN_OWNER: ${{ vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231' }}
+        with:
+          github-token: ${{ secrets.CODEX_REVIEW_TRIGGER_TOKEN }}
+          script: |
+            const label = 'ready-for-final-review';
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const expectedOwner = process.env.EXPECTED_TOKEN_OWNER.toLowerCase();
+            const authenticated = await github.rest.users.getAuthenticated();
+            if (authenticated.data.login?.toLowerCase() !== expectedOwner) {
+              core.setFailed('AI_REVIEW_TRIGGER_IDENTITY_MISMATCH');
+              return;
+            }
+            let labelRemoved = true;
+            if (pr.labels.some((candidate) => candidate.name === label)) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: pr.number,
+                  name: label,
+                });
+              } catch (error) {
+                // Some organizations intentionally restrict the
+                // pull_request_target token from mutating issue labels. The
+                // receipt gate below remains fail-closed, so a stale PASS can
+                // never authorize this new head; an authorized user must
+                // explicitly reapply the label to request a fresh review.
+                labelRemoved = false;
+                core.warning(`AI_CLI_REVIEW_LABEL_INVALIDATION_DENIED:${error.status || 'unknown'}`);
+              }
+            }
+            core.setOutput('label_removed', labelRemoved ? 'true' : 'false');
+
+      # Keep receipt publication on the short-lived workflow token. The
+      # dedicated token above never receives Checks permission or merge power.
+      - name: Publish final-head review requirement
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          LABEL_REMOVED: ${{ steps.remove-stale-label.outputs.label_removed }}
+        with:
+          script: |
+            const label = 'ready-for-final-review';
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            // Keep the pending prompt distinct from the required final receipt.
+            // GitHub evaluates all check runs with the required name on a SHA;
+            // reusing ai-review/receipt here would leave a completed
+            // action_required result alongside the later successful receipt.
+            await github.rest.checks.create({
+              owner,
+              repo,
+              name: 'ai-review/receipt-required',
+              head_sha: pr.head.sha,
+              status: 'completed',
+              conclusion: 'action_required',
+              external_id: `ai-review-invalidated:${pr.number}:${pr.head.sha}`,
+              output: {
+                title: 'Final-head AI review required',
+                summary: process.env.LABEL_REMOVED === 'true'
+                  ? `Apply ${label} to the stable, non-draft PR when it is ready for final review.`
+                  : `The workflow could not remove ${label}; remove and reapply it to request final review.`,
+              },
+            });
+
+  request-and-verify-review:
+    if: >-
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.base.ref == 'main' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.draft == false &&
+       github.event.action == 'labeled' &&
+       github.event.label.name == 'ready-for-final-review' &&
+       github.actor == (vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231')) ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/main' &&
+       inputs.pr_number > 0 &&
+       github.actor == (vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231'))
+    permissions:
+      checks: write
+      contents: read
+      issues: read
+      pull-requests: read
+    # Use the same immutable control-plane reference as every consumer
+    # repository. A relative call is not reliably matchable by GitHub's
+    # restricted runner-group workflow allowlist, which would leave this
+    # trust-root repository permanently queued. The exact commit below is
+    # separately allowlisted; advancing it requires a reviewed PR.
     uses: ./.github/workflows/codex-cli-review-receipt.yml
     with:
-      pr_number: 0
+      # workflow_dispatch inputs arrive as strings. Convert explicitly so the
+      # reusable workflow's number input receives a JSON number, not "19".
+      pr_number: ${{ github.event_name == 'workflow_dispatch' && fromJSON(inputs.pr_number) || 0 }}
       base_branch: main
-
+      # Keep the reusable workflow's requester check exactly aligned with the
+      # caller's protected-base authorization check. The value is a repository
+      # variable, not a credential, and is passed only as an immutable input.
+      requester_login: ${{ vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231' }}
+    secrets:
+      codex_trigger_token: ${{ secrets.CODEX_REVIEW_TRIGGER_TOKEN }}
