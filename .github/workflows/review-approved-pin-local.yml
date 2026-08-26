@@ -1,0 +1,193 @@
+name: Review approved pin required
+
+on:
+  # Public repositories cannot run a private ruleset workflow. Resolve this
+  # validator from protected main and read proposed files only through the API.
+  pull_request_target:
+
+permissions:
+  contents: read
+
+# Organization Rulesets execute this trusted source workflow for each selected
+# caller repository. It reads the proposed caller only as text through the
+# Contents API and never checks out or executes pull-request code.
+jobs:
+  approved-pin:
+    name: review-allowlist/approved-pin
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+      TARGET_REPOSITORY: ${{ github.repository }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      API_URL: ${{ github.api_url }}
+      CALLER_PATH: .github/workflows/codex-review-receipt-caller.yml
+      LOCAL_WORKFLOW_PATH: .github/workflows/codex-cli-review-receipt.yml
+      # Public repositories cannot call the private reusable workflow. Their
+      # protected-base local mirrors are admitted only by exact Git blob ID.
+      APPROVED_LOCAL_WORKFLOW_BLOBS: |
+        Schneider-Innovations/amazon-store-outpost-legal=b3fa292f8828abfa68bc87e3fc6cd13c2f2bbbd8
+        Schneider-Innovations/quickbooks-online-legal=b3fa292f8828abfa68bc87e3fc6cd13c2f2bbbd8
+      APPROVED_REUSABLE_REFS: |
+        0a32c354464b4289ad7c791434ac0ded5dfa00f5
+        3aed02cdf707b465184382eb301abe542b0e36ff
+        f03cfccf51847f09ba059068fd76d99c15150c8c
+        334d2b331fb2b8c9b4c3dcd2e308e6dfedaf940a
+        8e97b25ed86e6b6d7aaf07bd603b51726c38e3c4
+        945fc83f4ff11bab8f0c9992e7744011243eeb29
+        9956187ca1d111b7de67d7e7949dafa15f76dbb3
+        a248ee58c2ad9c356eac36334879e804c9e3b4d9
+        b9a1752a4a5cdd1dd6c74ef00efbe101f0dfc369
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify proposed caller uses a centrally approved revision
+        shell: ruby {0}
+        run: |
+          require "base64"
+          require "json"
+          require "net/http"
+          require "uri"
+          require "yaml"
+
+          repository = ENV.fetch("HEAD_REPOSITORY")
+          target_repository = ENV.fetch("TARGET_REPOSITORY")
+          head_sha = ENV.fetch("HEAD_SHA")
+          api_url = ENV.fetch("API_URL").sub(%r{/+$}, "")
+          caller_path = ENV.fetch("CALLER_PATH")
+          local_workflow_path = ENV.fetch("LOCAL_WORKFLOW_PATH")
+          token = ENV.fetch("GH_TOKEN")
+          approved = ENV.fetch("APPROVED_REUSABLE_REFS").lines
+            .map(&:strip).reject(&:empty?).map(&:downcase).uniq
+          local_entries = ENV.fetch("APPROVED_LOCAL_WORKFLOW_BLOBS").lines
+            .map(&:strip).reject(&:empty?).map { |entry|
+              name, blob = entry.split("=", 2)
+              [name.to_s.downcase, blob.to_s.downcase]
+            }
+          if local_entries.map(&:first).uniq.length != local_entries.length
+            abort("duplicate approved local workflow repository")
+          end
+          local_approved = local_entries.to_h
+
+          unless repository.match?(%r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z})
+            abort("invalid head repository context")
+          end
+          unless target_repository.match?(%r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z})
+            abort("invalid target repository context")
+          end
+          unless head_sha.match?(/\A[0-9a-f]{40}\z/)
+            abort("invalid pull-request head SHA")
+          end
+          if approved.empty? || approved.any? {
+            |ref| !ref.match?(/\A[0-9a-f]{40}\z/)
+          }
+            abort("invalid central approved revision list")
+          end
+          if local_approved.empty? || local_approved.any? { |name, blob|
+            !name.match?(%r{\A[a-z0-9_.-]+/[a-z0-9_.-]+\z}) ||
+              !blob.match?(/\A[0-9a-f]{40}\z/)
+          }
+            abort("invalid approved local workflow blob map")
+          end
+
+          fetch_file = lambda { |path|
+            encoded_path = path.split("/").map {
+              |part| URI.encode_www_form_component(part)
+            }.join("/")
+            uri = URI("#{api_url}/repos/#{repository}/contents/#{encoded_path}")
+            uri.query = URI.encode_www_form(ref: head_sha)
+            request = Net::HTTP::Get.new(uri)
+            request["Accept"] = "application/vnd.github+json"
+            request["Authorization"] = "Bearer #{token}"
+            request["User-Agent"] = "review-approved-pin-required"
+            request["X-GitHub-Api-Version"] = "2022-11-28"
+            response = Net::HTTP.start(
+              uri.host, uri.port, use_ssl: true, open_timeout: 10, read_timeout: 20
+            ) { |http| http.request(request) }
+            unless response.is_a?(Net::HTTPSuccess)
+              abort("could not read proposed #{path}: HTTP #{response.code}: " \
+                    "#{response.body.to_s[0, 300]}")
+            end
+            payload = JSON.parse(response.body)
+            unless payload["type"] == "file" && payload["encoding"] == "base64"
+              abort("unexpected Contents API response for #{path}")
+            end
+            content = Base64.strict_decode64(payload.fetch("content").delete("\n"))
+            content.force_encoding(Encoding::UTF_8)
+            abort("proposed #{path} is not valid UTF-8") unless content.valid_encoding?
+            [payload, content]
+          }
+
+          begin
+            _caller_payload, caller = fetch_file.call(caller_path)
+            document = YAML.safe_load(
+              caller, permitted_classes: [], permitted_symbols: [], aliases: false
+            )
+          rescue KeyError, ArgumentError, JSON::ParserError, Psych::Exception => error
+            abort("could not parse proposed caller: #{error.class}")
+          end
+
+          jobs = document.is_a?(Hash) ? document["jobs"] : nil
+          abort("proposed caller jobs must be a mapping") unless jobs.is_a?(Hash)
+          local_blob = local_approved[target_repository.downcase]
+          if local_blob
+            local_jobs = jobs.values.select { |job|
+              job.is_a?(Hash) &&
+                job["uses"] == "./.github/workflows/codex-cli-review-receipt.yml"
+            }
+            abort("expected exactly one approved local review job; " \
+                  "found #{local_jobs.length}") unless local_jobs.length == 1
+            local_job = local_jobs.first
+            expected_local_condition = <<~'CONDITION'.split.join(" ")
+              (github.event_name == 'pull_request_target' &&
+               github.event.pull_request.base.ref == 'main' &&
+               github.event.pull_request.head.repo.full_name == github.repository &&
+               github.event.pull_request.draft == false &&
+               github.event.action == 'labeled' &&
+               github.event.label.name == 'ready-for-final-review' &&
+               github.actor == (vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231')) ||
+              (github.event_name == 'workflow_dispatch' &&
+               github.ref == 'refs/heads/main' &&
+               inputs.pr_number > 0 &&
+               github.actor == (vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231'))
+            CONDITION
+            actual_local_condition = local_job["if"]
+            unless actual_local_condition.is_a?(String) &&
+                   actual_local_condition.split.join(" ") == expected_local_condition
+              abort("local review caller condition is not the protected trigger")
+            end
+            secrets = local_job["secrets"]
+            expected_connector_secret = "$" +
+              "{{ secrets.CODEX_REVIEW_TRIGGER_TOKEN }}"
+            unless secrets.is_a?(Hash) &&
+                   secrets.keys == ["codex_trigger_token"] &&
+                   secrets["codex_trigger_token"] ==
+                     expected_connector_secret
+              abort("local review caller must pass only the guarded Connector token")
+            end
+            local_payload, = fetch_file.call(local_workflow_path)
+            actual_blob = local_payload.fetch("sha", "").downcase
+            unless actual_blob == local_blob
+              abort("local review workflow blob #{actual_blob} is not centrally approved")
+            end
+            puts("approved local review workflow blob: #{actual_blob}")
+            exit(0)
+          end
+
+          prefix = "Schneider-Innovations/snd-quality-gate/.github/workflows/" \
+                   "codex-cli-review-receipt.yml@"
+          matches = jobs.values.filter_map { |job|
+            job.is_a?(Hash) && job["uses"].is_a?(String) ? job["uses"] : nil
+          }.filter_map { |uses|
+            match = uses.match(
+              /\A#{Regexp.escape(prefix)}([0-9a-f]{40})\z/i
+            )
+            match && match[1].downcase
+          }
+          abort("expected exactly one immutable snd-quality-gate review job; " \
+                "found #{matches.length}") unless matches.length == 1
+
+          selected = matches.first
+          unless approved.include?(selected)
+            abort("review caller revision #{selected} is not centrally approved")
+          end
+          puts("approved review caller revision: #{selected}")
