@@ -103,25 +103,39 @@ jobs:
             const label = 'ready-for-final-review';
             const pr = context.payload.pull_request;
             const { owner, repo } = context.repo;
-            // Keep the pending prompt distinct from the required final receipt.
-            // GitHub evaluates all check runs with the required name on a SHA;
-            // reusing ai-review/receipt here would leave a completed
-            // action_required result alongside the later successful receipt.
-            await github.rest.checks.create({
+            const externalId = `ai-review-invalidated:${pr.number}:${pr.head.sha}`;
+            const existingChecks = await github.paginate(
+              github.rest.checks.listForRef,
+              { owner, repo, ref: pr.head.sha, per_page: 100 },
+            );
+            const existing = existingChecks.find((check) =>
+              check.name === 'ai-review/receipt' && check.external_id === externalId,
+            );
+            const parameters = {
               owner,
               repo,
-              name: 'ai-review/receipt',
-              head_sha: pr.head.sha,
               status: 'completed',
               conclusion: 'action_required',
-              external_id: `ai-review-invalidated:${pr.number}:${pr.head.sha}`,
               output: {
                 title: 'Final-head AI review required',
                 summary: process.env.LABEL_REMOVED === 'true'
                   ? `Apply ${label} to the stable, non-draft PR when it is ready for final review.`
                   : `The workflow could not remove ${label}; remove and reapply it to request final review.`,
               },
-            });
+            };
+            if (existing) {
+              await github.rest.checks.update({
+                ...parameters,
+                check_run_id: existing.id,
+              });
+            } else {
+              await github.rest.checks.create({
+                ...parameters,
+                name: 'ai-review/receipt',
+                head_sha: pr.head.sha,
+                external_id: externalId,
+              });
+            }
 
   request-and-verify-review:
     if: >-
