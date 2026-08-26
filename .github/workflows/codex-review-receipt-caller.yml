@@ -104,19 +104,20 @@ jobs:
             const label = 'ready-for-final-review';
             const pr = context.payload.pull_request;
             const { owner, repo } = context.repo;
-            const upsertInvalidation = async (sha, externalId) => {
+            const upsertInvalidation = async (sha, externalIdPrefix) => {
               const existingChecks = await github.paginate(
                 github.rest.checks.listForRef,
                 { owner, repo, ref: sha, per_page: 100 },
               );
               const existing = existingChecks.find((check) =>
-                check.name === 'ai-review/receipt' && check.external_id === externalId,
+                check.name === 'ai-review/receipt' &&
+                  check.status !== 'completed' &&
+                  check.external_id?.startsWith(`${externalIdPrefix}:`),
               );
               const parameters = {
                 owner,
                 repo,
-                status: 'completed',
-                conclusion: 'action_required',
+                status: 'in_progress',
                 output: {
                   title: 'Final-head AI review required',
                   summary: process.env.LABEL_REMOVED === 'true'
@@ -134,7 +135,7 @@ jobs:
                   ...parameters,
                   name: 'ai-review/receipt',
                   head_sha: sha,
-                  external_id: externalId,
+                  external_id: `${externalIdPrefix}:${context.runId}`,
                 });
               }
             };

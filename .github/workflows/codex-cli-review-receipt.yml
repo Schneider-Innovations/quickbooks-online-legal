@@ -260,13 +260,15 @@ jobs:
                 status: 'pending',
               }, null, 2),
             };
-            const invalidationId = `ai-review-invalidated:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}`;
+            const invalidationPrefix = `ai-review-invalidated:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:`;
             const existingChecks = await github.paginate(
               github.rest.checks.listForRef,
               { ...context.repo, ref: process.env.HEAD_SHA, per_page: 100 },
             );
             const invalidation = existingChecks.find((check) =>
-              check.name === 'ai-review/receipt' && check.external_id === invalidationId,
+              check.name === 'ai-review/receipt' &&
+                check.status !== 'completed' &&
+                check.external_id?.startsWith(invalidationPrefix),
             );
             const headCheck = invalidation
               ? await github.rest.checks.update({
@@ -285,13 +287,15 @@ jobs:
                 });
             let mergeCheck;
             try {
-              const mergeInvalidationId = `ai-review-invalidated:merge:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:${process.env.MERGE_SHA}`;
+              const mergeInvalidationPrefix = `ai-review-invalidated:merge:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:${process.env.MERGE_SHA}:`;
               const existingMergeChecks = await github.paginate(
                 github.rest.checks.listForRef,
                 { ...context.repo, ref: process.env.MERGE_SHA, per_page: 100 },
               );
               const mergeInvalidation = existingMergeChecks.find((check) =>
-                check.name === 'ai-review/receipt' && check.external_id === mergeInvalidationId,
+                check.name === 'ai-review/receipt' &&
+                  check.status !== 'completed' &&
+                  check.external_id?.startsWith(mergeInvalidationPrefix),
               );
               mergeCheck = mergeInvalidation
                 ? await github.rest.checks.update({
