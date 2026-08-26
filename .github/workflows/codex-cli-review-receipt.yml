@@ -13,6 +13,20 @@ on:
         required: false
         type: string
         default: main
+      required_label:
+        description: Exact label that explicitly requests final-head review.
+        required: false
+        type: string
+        default: ready-for-final-review
+      requester_login:
+        description: Exact GitHub login allowed to request final-head review.
+        required: false
+        type: string
+        default: mercury1231
+    secrets:
+      codex_trigger_token:
+        description: Optional requester-owned token used only for guarded Connector escalation comments.
+        required: false
 
 # This workflow is only called by the base-owned pull_request_target caller in
 # this repository. It checks out a same-repository PR snapshot but never runs
@@ -20,6 +34,7 @@ on:
 permissions:
   checks: write
   contents: read
+  issues: read
   pull-requests: read
 
 jobs:
@@ -32,19 +47,26 @@ jobs:
     outputs:
       base_sha: ${{ steps.context.outputs.base_sha }}
       head_sha: ${{ steps.context.outputs.head_sha }}
+      merge_sha: ${{ steps.context.outputs.merge_sha }}
       merge_base_sha: ${{ steps.input.outputs.merge_base_sha }}
       pr_number: ${{ steps.context.outputs.pr_number }}
       request_id: ${{ steps.context.outputs.request_id }}
-      check_run_id: ${{ steps.receipt.outputs.check_run_id }}
+      head_check_run_id: ${{ steps.receipt.outputs.head_check_run_id }}
+      merge_check_run_id: ${{ steps.receipt.outputs.merge_check_run_id }}
     steps:
       - id: context
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
           PR_NUMBER: ${{ inputs.pr_number }}
           BASE_BRANCH: ${{ inputs.base_branch }}
+          REQUIRED_LABEL: ${{ inputs.required_label }}
+          REQUESTER_LOGIN: ${{ inputs.requester_login }}
         with:
           script: |
             const requestedPrNumber = Number(process.env.PR_NUMBER);
+            const requiredLabel = process.env.REQUIRED_LABEL;
+            const requesterLogin = process.env.REQUESTER_LOGIN;
+            const normalizedRequesterLogin = (requesterLogin || '').toLowerCase();
             const pr = context.payload.pull_request || (
               requestedPrNumber > 0
                 ? (await github.rest.pulls.get({ ...context.repo, pull_number: requestedPrNumber })).data
@@ -52,6 +74,10 @@ jobs:
             );
             if (!pr) {
               core.setFailed('AI_CLI_REVIEW_PR_CONTEXT_REQUIRED');
+              return;
+            }
+            if (!requiredLabel || !requesterLogin || (context.actor || '').toLowerCase() !== normalizedRequesterLogin) {
+              core.setFailed('AI_CLI_REVIEW_REQUESTER_FORBIDDEN');
               return;
             }
             const { owner, repo } = context.repo;
@@ -66,18 +92,62 @@ jobs:
               core.setFailed('AI_CLI_REVIEW_SCOPE_FORBIDDEN');
               return;
             }
+            if (!(pr.labels || []).some((label) => label.name === requiredLabel)) {
+              core.setFailed('AI_CLI_REVIEW_FINAL_LABEL_REQUIRED');
+              return;
+            }
+            if (context.payload.action === 'labeled' && context.payload.label?.name !== requiredLabel) {
+              core.setFailed('AI_CLI_REVIEW_FINAL_LABEL_REQUIRED');
+              return;
+            }
             const headSha = pr.head.sha.toLowerCase();
             const baseSha = pr.base.sha.toLowerCase();
+            // A strict required-check rule evaluates GitHub's synthetic PR
+            // merge commit, not merely the candidate head. Bind the second
+            // Check run to that immutable merge preview only after proving it
+            // has the exact base/head parents we are about to review. If the
+            // base or head advances later, GitHub creates a new merge preview
+            // without this receipt and blocks the merge until a new review.
+            let mergeSha;
+            try {
+              const mergeRef = await github.rest.git.getRef({
+                owner,
+                repo,
+                ref: `pull/${pr.number}/merge`,
+              });
+              mergeSha = mergeRef.data.object?.sha?.toLowerCase();
+              const mergeCommit = await github.rest.repos.getCommit({
+                owner,
+                repo,
+                ref: mergeSha,
+              });
+              const parents = new Set((mergeCommit.data.parents || []).map((parent) => parent.sha.toLowerCase()));
+              if (
+                !/^[0-9a-f]{40}$/.test(mergeSha || '') ||
+                parents.size !== 2 ||
+                !parents.has(baseSha) ||
+                !parents.has(headSha)
+              ) {
+                throw new Error('AI_CLI_REVIEW_MERGE_REF_INVALID');
+              }
+            } catch {
+              core.setFailed('AI_CLI_REVIEW_MERGE_REF_UNAVAILABLE');
+              return;
+            }
             const requestId = `cli-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT || '1'}-${pr.number}-${headSha.slice(0, 12)}`;
             core.setOutput('head_sha', headSha);
             core.setOutput('base_sha', baseSha);
+            core.setOutput('merge_sha', mergeSha);
             core.setOutput('pr_number', String(pr.number));
             core.setOutput('request_id', requestId);
 
-      - name: Check out exact candidate snapshot without credentials
+      - name: Check out verified merge-preview snapshot without credentials
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: ${{ steps.context.outputs.head_sha }}
+          # The context step proved this synthetic commit has the current
+          # base and candidate-head parents. Review the actual merge result,
+          # rather than publishing a candidate-only receipt to this SHA.
+          ref: ${{ steps.context.outputs.merge_sha }}
           # Fetch history while checkout holds its short-lived repository token.
           # That action removes the token before the untrusted snapshot is read.
           fetch-depth: 0
@@ -89,6 +159,7 @@ jobs:
         env:
           BASE_SHA: ${{ steps.context.outputs.base_sha }}
           HEAD_SHA: ${{ steps.context.outputs.head_sha }}
+          MERGE_SHA: ${{ steps.context.outputs.merge_sha }}
           PR_NUMBER: ${{ steps.context.outputs.pr_number }}
           REQUEST_ID: ${{ steps.context.outputs.request_id }}
           REPOSITORY: ${{ github.repository }}
@@ -107,7 +178,7 @@ jobs:
           test ! -e "$target"
           mkdir "$temporary"
           trap 'rm -rf -- "$temporary"' EXIT
-          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          test "$(git rev-parse HEAD)" = "$MERGE_SHA"
           merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
           test -n "$merge_base"
           test "$merge_base" = "$(git rev-parse "$merge_base")"
@@ -115,16 +186,40 @@ jobs:
           git merge-base --is-ancestor "$merge_base" "$HEAD_SHA"
           export MERGE_BASE_SHA="$merge_base"
           printf 'merge_base_sha=%s\n' "$merge_base" >> "$GITHUB_OUTPUT"
-          git diff --no-ext-diff --binary "$merge_base" "$HEAD_SHA" -- > "$temporary/diff.patch"
-          git ls-files -z | tar --create --no-recursion --verbatim-files-from --null --files-from=- --gzip --file="$temporary/source.tar.gz"
-          git diff --no-ext-diff --name-only -z "$merge_base" "$HEAD_SHA" -- > "$temporary/changed-files.z"
+          # ``MERGE_SHA`` is a verified base/head merge preview. The model
+          # receives the exact changes this strict-gate Check would merge and
+          # a full snapshot of that resulting tree.
+          git diff --no-ext-diff --no-textconv --binary "$BASE_SHA" "$MERGE_SHA" -- > "$temporary/diff.patch"
+          source_root="$temporary/source"
+          mkdir -- "$source_root"
+          # Do not use git archive: it honors export-ignore and could omit a
+          # tracked file from the isolated review snapshot.
+          source_tree="$temporary/source-tree.tar"
+          git ls-files -z | tar --create --no-recursion --verbatim-files-from --null --files-from=- --file="$source_tree"
+          tar --extract --no-same-owner --no-same-permissions --file="$source_tree" -C "$source_root"
+          rm -f -- "$source_tree"
+          # The isolated agent rejects symlinks too. Reject them before marker
+          # creation so a candidate-controlled path can never escape the
+          # temporary snapshot tree.
+          if test -n "$(find "$source_root" -type l -print -quit)"; then
+            echo "candidate snapshot contains symlink" >&2
+            exit 1
+          fi
+          # Deleted paths intentionally have no placeholder inside the merged
+          # source tree. Their complete prior content and deletion are retained
+          # in diff.patch, avoiding file-to-directory marker collisions.
+          (
+            cd "$source_root"
+            find . -type f -print0 | tar --create --no-recursion --verbatim-files-from --null --files-from=- --gzip --file="$temporary/source.tar.gz"
+          )
+          git diff --no-ext-diff --no-textconv --name-only -z "$BASE_SHA" "$MERGE_SHA" -- > "$temporary/changed-files.z"
           # Node is supplied by the pinned GitHub actions. It avoids shell JSON
           # interpolation and binds the review contract to the exact diff.
           node - "$temporary/changed-files.z" "$temporary/request.json" <<'NODE'
           const fs = require('fs');
           const [changedFilesPath, requestPath] = process.argv.slice(2);
           const changedFiles = fs.readFileSync(changedFilesPath).toString('utf8').split('\0').filter(Boolean);
-          if (!changedFiles.length || new Set(changedFiles).size !== changedFiles.length) {
+          if (new Set(changedFiles).size !== changedFiles.length) {
             throw new Error('AI_CLI_REVIEW_CHANGED_FILES_INVALID');
           }
           const request = {
@@ -134,6 +229,7 @@ jobs:
             head_sha: process.env.HEAD_SHA,
             base_sha: process.env.BASE_SHA,
             merge_base_sha: process.env.MERGE_BASE_SHA,
+            merge_sha: process.env.MERGE_SHA,
             changed_files: changedFiles,
           };
           fs.writeFileSync(requestPath, `${JSON.stringify(request)}\n`, { mode: 0o640 });
@@ -147,29 +243,92 @@ jobs:
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
           HEAD_SHA: ${{ steps.context.outputs.head_sha }}
+          MERGE_SHA: ${{ steps.context.outputs.merge_sha }}
           PR_NUMBER: ${{ steps.context.outputs.pr_number }}
           REQUEST_ID: ${{ steps.context.outputs.request_id }}
         with:
           script: |
-            const check = await github.rest.checks.create({
-              ...context.repo,
-              name: 'ai-review/receipt',
-              head_sha: process.env.HEAD_SHA,
-              status: 'in_progress',
-              external_id: `ai-cli-review:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}`,
-              output: {
-                title: 'Codex CLI review pending',
-                summary: `Shadow CLI review requested for ${process.env.HEAD_SHA}.`,
-                text: JSON.stringify({
-                  schema_version: '1.0',
-                  mode: 'shadow',
-                  request_id: process.env.REQUEST_ID,
+            const output = {
+              title: 'Codex CLI review pending',
+              summary: `Shadow CLI review requested for ${process.env.HEAD_SHA}; strict merge gate targets ${process.env.MERGE_SHA}.`,
+              text: JSON.stringify({
+                schema_version: '1.0',
+                mode: 'shadow',
+                request_id: process.env.REQUEST_ID,
+                head_sha: process.env.HEAD_SHA,
+                merge_sha: process.env.MERGE_SHA,
+                status: 'pending',
+              }, null, 2),
+            };
+            const invalidationPrefix = `ai-review-invalidated:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:`;
+            const existingChecks = await github.paginate(
+              github.rest.checks.listForRef,
+              { ...context.repo, ref: process.env.HEAD_SHA, per_page: 100 },
+            );
+            const invalidation = existingChecks.find((check) =>
+              check.name === 'ai-review/receipt' &&
+                check.status !== 'completed' &&
+                check.external_id?.startsWith(invalidationPrefix),
+            );
+            const headCheck = invalidation
+              ? await github.rest.checks.update({
+                  ...context.repo,
+                  check_run_id: invalidation.id,
+                  status: 'in_progress',
+                  output,
+                })
+              : await github.rest.checks.create({
+                  ...context.repo,
+                  name: 'ai-review/receipt',
                   head_sha: process.env.HEAD_SHA,
-                  status: 'pending',
-                }, null, 2),
-              },
-            });
-            core.setOutput('check_run_id', String(check.data.id));
+                  status: 'in_progress',
+                  external_id: `ai-cli-review:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}`,
+                  output,
+                });
+            let mergeCheck;
+            try {
+              const mergeInvalidationPrefix = `ai-review-invalidated:merge:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:${process.env.MERGE_SHA}:`;
+              const existingMergeChecks = await github.paginate(
+                github.rest.checks.listForRef,
+                { ...context.repo, ref: process.env.MERGE_SHA, per_page: 100 },
+              );
+              const mergeInvalidation = existingMergeChecks.find((check) =>
+                check.name === 'ai-review/receipt' &&
+                  check.status !== 'completed' &&
+                  check.external_id?.startsWith(mergeInvalidationPrefix),
+              );
+              mergeCheck = mergeInvalidation
+                ? await github.rest.checks.update({
+                    ...context.repo,
+                    check_run_id: mergeInvalidation.id,
+                    status: 'in_progress',
+                    output,
+                  })
+                : await github.rest.checks.create({
+                    ...context.repo,
+                    name: 'ai-review/receipt',
+                    head_sha: process.env.MERGE_SHA,
+                    status: 'in_progress',
+                    external_id: `ai-cli-review:merge:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:${process.env.MERGE_SHA}`,
+                    output,
+                  });
+            } catch {
+              await github.rest.checks.update({
+                ...context.repo,
+                check_run_id: headCheck.data.id,
+                status: 'completed',
+                conclusion: 'failure',
+                completed_at: new Date().toISOString(),
+                output: {
+                  title: 'Codex CLI strict merge receipt unavailable',
+                  summary: 'Fail-closed Shadow result: merge_receipt_create_failed.',
+                },
+              });
+              core.setFailed('AI_CLI_REVIEW_MERGE_RECEIPT_CREATE_FAILED');
+              return;
+            }
+            core.setOutput('head_check_run_id', String(headCheck.data.id));
+            core.setOutput('merge_check_run_id', String(mergeCheck.data.id));
 
       - name: Remove submitted snapshot after failed preparation
         if: (failure() || cancelled()) && steps.context.outputs.request_id != ''
@@ -194,13 +353,15 @@ jobs:
     runs-on:
       group: code-review
       labels: [self-hosted, code-review, cli-review, shadow-only]
-    timeout-minutes: 14
+    timeout-minutes: 28
     steps:
       - id: receipt
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
-          CHECK_RUN_ID: ${{ needs.prepare-cli-review.outputs.check_run_id }}
+          HEAD_CHECK_RUN_ID: ${{ needs.prepare-cli-review.outputs.head_check_run_id }}
+          MERGE_CHECK_RUN_ID: ${{ needs.prepare-cli-review.outputs.merge_check_run_id }}
           HEAD_SHA: ${{ needs.prepare-cli-review.outputs.head_sha }}
+          MERGE_SHA: ${{ needs.prepare-cli-review.outputs.merge_sha }}
           BASE_SHA: ${{ needs.prepare-cli-review.outputs.base_sha }}
           MERGE_BASE_SHA: ${{ needs.prepare-cli-review.outputs.merge_base_sha }}
           PR_NUMBER: ${{ needs.prepare-cli-review.outputs.pr_number }}
@@ -229,6 +390,7 @@ jobs:
               await new Promise((resolve) => setTimeout(resolve, 10 * 1000));
             }
             const expectedHead = process.env.HEAD_SHA;
+            const expectedMerge = process.env.MERGE_SHA;
             const expectedBase = process.env.BASE_SHA;
             const expectedMergeBase = process.env.MERGE_BASE_SHA;
             // This is sha256("review-result-schema/v2\\0" + the approved
@@ -237,13 +399,27 @@ jobs:
             // untrusted receipt has a SHA-shaped value.  Changing the agent
             // prompt or result contract must therefore be accompanied by a
             // reviewed control-plane change.
-            const expectedPolicyDigest = '5999c77487d11a8aff899dcc33153a9faca5708c6b0031cbf7e0130b88871cc9';
+            const expectedPolicyDigest = '943ed3ffbe420a8418c0e55e869c69bd52d21d234f8359284e73bd8a7fa6ab3a';
             const changed = await github.paginate(github.rest.pulls.listFiles, {
               ...context.repo,
               pull_number: Number(process.env.PR_NUMBER),
               per_page: 100,
             });
             const expectedChangedFiles = changed.map((file) => file.filename).sort();
+            const highRiskPaths = changed.flatMap((file) =>
+              [file.filename, file.previous_filename].filter(Boolean),
+            );
+            const highRiskPatterns = [
+              /^\.github\/workflows\//,
+              /^(config|scripts)\/ci-runners\//,
+              /(^|\/)(auth|authorization|permissions?|rulesets?|secrets?|security)(\/|[-_.])/i,
+              /(^|\/)(deploy|deployment|production|terraform|tofu)(\/|[-_.])/i,
+              /(^|\/)_?middleware\.[cm]?[jt]sx?$/i,
+              /\.(tf|tfvars)$/i,
+            ];
+            const highRiskFiles = [...new Set(highRiskPaths.filter((file) =>
+              highRiskPatterns.some((pattern) => pattern.test(file)),
+            ))].sort();
             const isStringArray = (value) => Array.isArray(value) && value.every((item) => typeof item === 'string' && item.length > 0 && item.length <= 512);
             const sameSortedStrings = (value, expected) => isStringArray(value) &&
               [...value].sort().every((item, index) => item === expected[index]) && value.length === expected.length;
@@ -271,6 +447,7 @@ jobs:
               receipt.request_id === requestId &&
               receipt.pr_number === Number(process.env.PR_NUMBER) &&
               receipt.head_sha === expectedHead &&
+              receipt.merge_sha === expectedMerge &&
               receipt.base_sha === expectedBase &&
               receipt.merge_base_sha === expectedMergeBase &&
               receipt.status === 'completed' &&
@@ -297,13 +474,39 @@ jobs:
                 : !clear && receipt.decision === 'PASS'
                   ? 'review_coverage_incomplete'
                   : `decision_${receipt.decision.toLowerCase()}`;
+            // A malformed bridge receipt must never influence the gate
+            // decision.  Preserve only a small, base-owned allowlist of
+            // producer diagnostics so an operational input/model failure is
+            // distinguishable from an arbitrary malformed JSON payload.
+            const bridgeDiagnosticCodes = new Set([
+              'agent_internal_error',
+              'broker_input_changed',
+              'broker_input_invalid',
+              'diff_input_invalid',
+              'model_output_invalid',
+              'model_unavailable',
+              'request_directory_invalid',
+              'request_json_invalid',
+              'request_schema_invalid',
+              'review_context_invalid',
+              'review_context_too_large',
+              'snapshot_input_invalid',
+              'snapshot_invalid',
+              'snapshot_too_large',
+            ]);
+            const bridge_reason_code = receipt && typeof receipt.reason_code === 'string' &&
+              bridgeDiagnosticCodes.has(receipt.reason_code)
+              ? receipt.reason_code
+              : null;
             let output = valid ? receipt : {
               schema_version: '1.0',
               mode: 'shadow',
               request_id: requestId,
               head_sha: expectedHead,
+              merge_sha: expectedMerge,
               status: 'unavailable',
               reason_code: reason,
+              bridge_reason_code,
             };
             let receiptText = JSON.stringify(output);
             // GitHub Checks accepts at most 65,535 characters. Keep a buffer
@@ -317,25 +520,425 @@ jobs:
                 mode: 'shadow',
                 request_id: requestId,
                 head_sha: expectedHead,
+                merge_sha: expectedMerge,
                 status: 'unavailable',
                 reason_code: reason,
               };
               receiptText = JSON.stringify(output);
             }
+            const cliClear = conclusion === 'success';
+            const operationalEscalationReasons = new Set([
+              'result_missing_or_malformed',
+              'result_contract_invalid',
+              'review_coverage_incomplete',
+              'result_too_large',
+              'decision_inconclusive',
+            ]);
+            // A complete CLI BLOCK already contains actionable findings and
+            // remains blocking without spending a second reviewer call. A
+            // complete PASS on sensitive paths, or an unusable CLI result,
+            // requires an independent Connector review before these pending
+            // checks can be completed.
+            const escalationRequired = operationalEscalationReasons.has(reason) ||
+              (cliClear && highRiskFiles.length > 0);
+            core.setOutput('cli_clear', cliClear ? 'true' : 'false');
+            core.setOutput('cli_reason', reason);
+            core.setOutput('escalation_required', escalationRequired ? 'true' : 'false');
+            core.setOutput('escalation_reason', operationalEscalationReasons.has(reason)
+              ? `cli_${reason}`
+              : 'high_risk_paths');
+            core.setOutput('high_risk_files', JSON.stringify(highRiskFiles.slice(0, 50)));
+            if (escalationRequired) {
+              core.notice(`AI_CLI_REVIEW_CONNECTOR_ESCALATION_REQUIRED:${reason}`);
+              return;
+            }
+            const checkOutput = {
+              title: conclusion === 'success' ? 'Codex CLI reviewed current head' : 'Codex CLI review receipt not ready',
+              summary: conclusion === 'success' ? output.summary : `Fail-closed Shadow result: ${reason}.`,
+              text: receiptText,
+            };
             await github.rest.checks.update({
               ...context.repo,
-              check_run_id: Number(process.env.CHECK_RUN_ID),
+              check_run_id: Number(process.env.HEAD_CHECK_RUN_ID),
               status: 'completed',
               conclusion,
               completed_at: new Date().toISOString(),
-              output: {
-                title: conclusion === 'success' ? 'Codex CLI reviewed current head' : 'Codex CLI review receipt not ready',
-                summary: conclusion === 'success' ? output.summary : `Fail-closed Shadow result: ${reason}.`,
-                text: receiptText,
-              },
+              output: checkOutput,
+            });
+            await github.rest.checks.update({
+              ...context.repo,
+              check_run_id: Number(process.env.MERGE_CHECK_RUN_ID),
+              status: 'completed',
+              conclusion,
+              completed_at: new Date().toISOString(),
+              output: checkOutput,
             });
             if (conclusion !== 'success') {
               core.setFailed(`AI_CLI_REVIEW_NOT_READY:${reason}`);
+            }
+
+      - id: connector-request
+        name: Request independent Connector review when required
+        if: always() && steps.receipt.outputs.escalation_required == 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          PR_NUMBER: ${{ needs.prepare-cli-review.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.prepare-cli-review.outputs.head_sha }}
+          MERGE_SHA: ${{ needs.prepare-cli-review.outputs.merge_sha }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+          REQUIRED_LABEL: ${{ inputs.required_label }}
+          REQUESTER_LOGIN: ${{ inputs.requester_login }}
+          ESCALATION_REASON: ${{ steps.receipt.outputs.escalation_reason }}
+          HIGH_RISK_FILES: ${{ steps.receipt.outputs.high_risk_files }}
+        with:
+          github-token: ${{ secrets.codex_trigger_token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number(process.env.PR_NUMBER);
+            const headSha = process.env.HEAD_SHA;
+            const mergeSha = process.env.MERGE_SHA;
+            const requesterLogin = process.env.REQUESTER_LOGIN.toLowerCase();
+            if (
+              !Number.isInteger(prNumber) || prNumber <= 0 ||
+              !/^[0-9a-f]{40}$/.test(headSha) ||
+              !/^[0-9a-f]{40}$/.test(mergeSha) ||
+              !requesterLogin
+            ) {
+              core.setFailed('AI_CONNECTOR_ESCALATION_CONFIGURATION_INVALID');
+              return;
+            }
+            let authenticated;
+            try {
+              authenticated = (await github.rest.users.getAuthenticated()).data;
+            } catch {
+              core.setFailed('AI_CONNECTOR_ESCALATION_TOKEN_UNAVAILABLE');
+              return;
+            }
+            if (authenticated.login?.toLowerCase() !== requesterLogin) {
+              core.setFailed('AI_CONNECTOR_ESCALATION_IDENTITY_MISMATCH');
+              return;
+            }
+            const pr = (await github.rest.pulls.get({ owner, repo, pull_number: prNumber })).data;
+            const currentMerge = (await github.rest.git.getRef({
+              owner,
+              repo,
+              ref: `pull/${prNumber}/merge`,
+            })).data.object?.sha?.toLowerCase();
+            if (
+              pr.state !== 'open' || pr.draft ||
+              pr.base.ref !== process.env.BASE_BRANCH ||
+              pr.head.repo?.full_name !== `${owner}/${repo}` ||
+              pr.head.sha.toLowerCase() !== headSha ||
+              currentMerge !== mergeSha ||
+              !pr.labels.some((label) => label.name === process.env.REQUIRED_LABEL)
+            ) {
+              core.setFailed('AI_CONNECTOR_ESCALATION_CONTEXT_CHANGED');
+              return;
+            }
+            const marker = `<!-- si-ai-review-escalation head=${headSha} merge=${mergeSha} -->`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) =>
+              comment.user?.login?.toLowerCase() === requesterLogin &&
+              comment.body?.includes(marker),
+            );
+            const highRiskFiles = (() => {
+              try { return JSON.parse(process.env.HIGH_RISK_FILES || '[]'); } catch { return []; }
+            })();
+            const boundedFiles = Array.isArray(highRiskFiles)
+              ? highRiskFiles.filter((item) => typeof item === 'string').slice(0, 20)
+              : [];
+            const fileNote = boundedFiles.length
+              ? `\n\nHigh-risk paths:\n${boundedFiles.map((file) => `- \`${file}\``).join('\n')}`
+              : '';
+            const request = existing || (await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: prNumber,
+              body: `${marker}\n\n@codex review\n\nIndependent deep review required for exact head \`${headSha}\` (merge preview \`${mergeSha}\`). Trigger: \`${process.env.ESCALATION_REASON}\`. Report \`Reviewed commit:\` and either findings as \`[P0]\`-\`[P3]\` or the explicit phrase \`No major issues found.\`${fileNote}\n\nThis request is deduplicated by exact head and is not approval.`,
+            })).data;
+            if (!request.html_url || !request.created_at) {
+              core.setFailed('AI_CONNECTOR_ESCALATION_REQUEST_INVALID');
+              return;
+            }
+            core.setOutput('request_comment_url', request.html_url);
+            core.setOutput('request_comment_id', String(request.id));
+            core.setOutput('started_at', request.created_at);
+
+      - id: connector-evidence
+        name: Verify independent Connector evidence
+        if: always() && steps.receipt.outputs.escalation_required == 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          HEAD_CHECK_RUN_ID: ${{ needs.prepare-cli-review.outputs.head_check_run_id }}
+          MERGE_CHECK_RUN_ID: ${{ needs.prepare-cli-review.outputs.merge_check_run_id }}
+          HEAD_SHA: ${{ needs.prepare-cli-review.outputs.head_sha }}
+          MERGE_SHA: ${{ needs.prepare-cli-review.outputs.merge_sha }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+          PR_NUMBER: ${{ needs.prepare-cli-review.outputs.pr_number }}
+          CLI_CLEAR: ${{ steps.receipt.outputs.cli_clear }}
+          CLI_REASON: ${{ steps.receipt.outputs.cli_reason }}
+          ESCALATION_REASON: ${{ steps.receipt.outputs.escalation_reason }}
+          REQUEST_COMMENT_URL: ${{ steps.connector-request.outputs.request_comment_url }}
+          REQUEST_COMMENT_ID: ${{ steps.connector-request.outputs.request_comment_id }}
+          STARTED_AT: ${{ steps.connector-request.outputs.started_at }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number(process.env.PR_NUMBER);
+            const headSha = process.env.HEAD_SHA;
+            const mergeSha = process.env.MERGE_SHA;
+            const startedAtMilliseconds = Date.parse(process.env.STARTED_AT || '');
+            const reviewerLogins = new Set([
+              'chatgpt-codex-connector',
+              'chatgpt-codex-connector[bot]',
+            ]);
+            let connectorStatus = 'request_failed';
+            let connectorReason = 'connector_request_failed';
+            let evidenceUrl = null;
+            let reviewedSha = null;
+            if (Number.isFinite(startedAtMilliseconds)) {
+              let deadline = Date.now() + 720 * 1000;
+              let delaySeconds = 0;
+              let cleanFirstSeenAt = null;
+              let confirmationExtended = false;
+              let formatFirstSeenAt = null;
+              connectorStatus = 'unavailable';
+              connectorReason = 'connector_timeout';
+              while (true) {
+                if (delaySeconds > 0) {
+                  const remainingMilliseconds = deadline - Date.now();
+                  if (remainingMilliseconds <= 0) break;
+                  await new Promise((resolve) => setTimeout(
+                    resolve,
+                    Math.min(delaySeconds * 1000, remainingMilliseconds),
+                  ));
+                }
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  per_page: 100,
+                });
+                const reviews = await github.paginate(github.rest.pulls.listReviews, {
+                  owner,
+                  repo,
+                  pull_number: prNumber,
+                  per_page: 100,
+                });
+                const reviewComments = await github.paginate(
+                  github.rest.pulls.listReviewComments,
+                  { owner, repo, pull_number: prNumber, per_page: 100 },
+                );
+                const reviewCandidates = reviews.map((review) => ({
+                    body: review.body || '',
+                    createdAt: review.submitted_at,
+                    login: review.user?.login?.toLowerCase(),
+                    url: review.html_url,
+                    reviewedSha: review.commit_id,
+                    inlineFindingUrls: [],
+                  }));
+                const inlineCandidates = [];
+                for (const comment of reviewComments) {
+                  const login = comment.user?.login?.toLowerCase();
+                  if (reviewerLogins.has(login)) {
+                    inlineCandidates.push({
+                      body: comment.body || '',
+                      createdAt: comment.created_at,
+                      login,
+                      url: comment.html_url,
+                      // GitHub may anchor a fresh inline finding to an older
+                      // line commit. Identity plus post-request creation time
+                      // is sufficient because every trusted inline comment is
+                      // conservatively treated as a finding below.
+                      reviewedSha: headSha,
+                      inlineFindingUrls: [comment.html_url],
+                    });
+                  }
+                }
+                const candidates = [
+                  ...comments.map((item) => ({
+                    body: item.body || '', createdAt: item.created_at,
+                    login: item.user?.login?.toLowerCase(), url: item.html_url,
+                  })),
+                  ...reviewCandidates,
+                  ...inlineCandidates,
+                ].filter((item) =>
+                  reviewerLogins.has(item.login) && item.createdAt &&
+                  Date.parse(item.createdAt) >= startedAtMilliseconds,
+                );
+                const exactCandidates = [];
+                let staleCandidate = null;
+                for (const candidate of candidates) {
+                  const match = candidate.body.match(
+                    /Reviewed commit:\*?\*?\s*`?([0-9a-f]{7,40})`?/i,
+                  );
+                  if (!candidate.reviewedSha && !match) {
+                    if (/usage limits|rate limit|limit.*review/i.test(candidate.body)) {
+                      connectorReason = 'connector_unavailable';
+                    }
+                    continue;
+                  }
+                  reviewedSha = (candidate.reviewedSha || match[1]).toLowerCase();
+                  if (reviewedSha.length < 40) {
+                    try {
+                      reviewedSha = (await github.rest.repos.getCommit({
+                        owner, repo, ref: reviewedSha,
+                      })).data.sha.toLowerCase();
+                    } catch {
+                      connectorReason = 'connector_evidence_unparseable';
+                      continue;
+                    }
+                  }
+                  if (reviewedSha !== headSha) {
+                    staleCandidate = { url: candidate.url, sha: reviewedSha };
+                    continue;
+                  }
+                  exactCandidates.push(candidate);
+                }
+                let cleanReaction = null;
+                const requestCommentId = Number(process.env.REQUEST_COMMENT_ID);
+                if (Number.isInteger(requestCommentId) && requestCommentId > 0) {
+                  const reactions = await github.paginate(
+                    github.rest.reactions.listForIssueComment,
+                    { owner, repo, comment_id: requestCommentId, per_page: 100 },
+                  );
+                  cleanReaction = reactions.find((reaction) =>
+                    reaction.content === '+1' &&
+                    reviewerLogins.has(reaction.user?.login?.toLowerCase()) &&
+                    (!reaction.created_at || Date.parse(reaction.created_at) >= startedAtMilliseconds),
+                  ) || null;
+                }
+                const finding = exactCandidates.find((candidate) =>
+                  candidate.inlineFindingUrls?.length > 0 ||
+                    /\[P[0-3](?:\s+Badge)?\]/i.test(candidate.body),
+                );
+                const clean = exactCandidates.find((candidate) =>
+                  /no major issues found\.?/i.test(candidate.body) ||
+                    /未发现.{0,12}(重大|主要).{0,8}问题/i.test(candidate.body),
+                );
+                // Aggregate the parent review and every inline review comment.
+                // Findings always win, regardless of API ordering or an earlier
+                // clean comment. A clean signal must survive another poll so a
+                // later inline finding cannot race a successful Check update.
+                if (finding) {
+                  connectorStatus = 'blocked';
+                  connectorReason = 'connector_findings_present';
+                  evidenceUrl = finding.inlineFindingUrls?.[0] || finding.url;
+                  break;
+                }
+                if (clean || cleanReaction) {
+                  evidenceUrl = clean?.url || process.env.REQUEST_COMMENT_URL;
+                  reviewedSha = headSha;
+                  cleanFirstSeenAt ||= Date.now();
+                  if (!confirmationExtended && deadline - cleanFirstSeenAt < 45 * 1000) {
+                    deadline = cleanFirstSeenAt + 45 * 1000;
+                    confirmationExtended = true;
+                  }
+                  if (Date.now() - cleanFirstSeenAt >= 30 * 1000) {
+                    connectorStatus = 'passed';
+                    connectorReason = 'connector_clean';
+                    break;
+                  }
+                } else {
+                  cleanFirstSeenAt = null;
+                  if (exactCandidates.length > 0) {
+                    evidenceUrl = exactCandidates[0].url;
+                    formatFirstSeenAt ||= Date.now();
+                    if (Date.now() - formatFirstSeenAt >= 30 * 1000) {
+                      connectorStatus = 'inconclusive';
+                      connectorReason = 'connector_format_invalid';
+                      break;
+                    }
+                  } else {
+                    formatFirstSeenAt = null;
+                  }
+                }
+                if (staleCandidate) {
+                  connectorStatus = 'stale';
+                  connectorReason = 'connector_reviewed_sha_stale';
+                  evidenceUrl = staleCandidate.url;
+                  reviewedSha = staleCandidate.sha;
+                }
+                const remainingSeconds = Math.floor((deadline - Date.now()) / 1000);
+                if (remainingSeconds <= 0) break;
+                delaySeconds = delaySeconds === 0
+                  ? 60
+                  : Math.min(delaySeconds * 2, 300, remainingSeconds);
+              }
+            }
+            let currentContext = false;
+            try {
+              const pr = (await github.rest.pulls.get({ owner, repo, pull_number: prNumber })).data;
+              const currentMerge = (await github.rest.git.getRef({
+                owner,
+                repo,
+                ref: `pull/${prNumber}/merge`,
+              })).data.object?.sha?.toLowerCase();
+              currentContext = pr.state === 'open' && !pr.draft &&
+                pr.base.ref === process.env.BASE_BRANCH &&
+                pr.head.repo?.full_name === `${owner}/${repo}` &&
+                pr.head.sha.toLowerCase() === headSha && currentMerge === mergeSha;
+            } catch {
+              currentContext = false;
+            }
+            if (!currentContext) {
+              connectorStatus = 'stale';
+              connectorReason = 'connector_context_changed';
+            }
+            // A trusted exact-head Connector review may substitute only for an
+            // unusable CLI result. A complete CLI BLOCK is intentionally not
+            // escalated, while clean high-risk CLI results still require both
+            // reviewers to pass.
+            const connectorSubstitutionReasons = new Set([
+              'result_missing_or_malformed',
+              'result_contract_invalid',
+              'review_coverage_incomplete',
+              'result_too_large',
+              'decision_inconclusive',
+            ]);
+            const connectorSubstituted = connectorSubstitutionReasons.has(process.env.CLI_REASON) &&
+              connectorStatus === 'passed';
+            const finalClear = connectorStatus === 'passed' &&
+              (process.env.CLI_CLEAR === 'true' || connectorSubstituted);
+            const output = {
+              schema_version: '1.0',
+              mode: 'shadow',
+              head_sha: headSha,
+              merge_sha: mergeSha,
+              cli_clear: process.env.CLI_CLEAR === 'true',
+              connector_substituted_for_unusable_cli: connectorSubstituted,
+              cli_reason: process.env.CLI_REASON,
+              escalation_reason: process.env.ESCALATION_REASON,
+              connector_status: connectorStatus,
+              connector_reason: connectorReason,
+              connector_reviewed_sha: reviewedSha,
+              request_comment_url: process.env.REQUEST_COMMENT_URL || null,
+              review_evidence_url: evidenceUrl,
+            };
+            const checkOutput = {
+              title: finalClear ? 'CLI and Connector reviewed current merge' : 'Conditional deep review not ready',
+              summary: finalClear
+                ? `Independent Connector evidence: ${evidenceUrl}.`
+                : `Fail-closed Shadow result: ${connectorReason}; CLI: ${process.env.CLI_REASON}.`,
+              text: JSON.stringify(output, null, 2),
+            };
+            for (const checkRunId of [process.env.HEAD_CHECK_RUN_ID, process.env.MERGE_CHECK_RUN_ID]) {
+              await github.rest.checks.update({
+                ...context.repo,
+                check_run_id: Number(checkRunId),
+                status: 'completed',
+                conclusion: finalClear ? 'success' : 'failure',
+                completed_at: new Date().toISOString(),
+                output: checkOutput,
+              });
+            }
+            if (!finalClear) {
+              core.setFailed(`AI_CONNECTOR_REVIEW_NOT_READY:${connectorReason}`);
             }
 
       - name: Remove submitted snapshot
@@ -355,19 +958,8 @@ jobs:
             }
             fs.rmSync(target, { recursive: true, force: true });
 
-      - name: Remove consumed review receipt
-        if: always()
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
-        env:
-          REQUEST_ID: ${{ needs.prepare-cli-review.outputs.request_id }}
-        with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            const root = path.resolve('/var/lib/codex-review-bridge/outgoing');
-            const target = path.resolve(root, `${process.env.REQUEST_ID}.json`);
-            if (!target.startsWith(`${root}${path.sep}`)) {
-              core.setFailed('AI_CLI_REVIEW_RECEIPT_CLEANUP_PATH_INVALID');
-              return;
-            }
-            fs.rmSync(target, { force: true });
+      # Retain the bounded receipt for the root-owned claim broker. It first
+      # observes that durable output to remove the private claimed snapshot,
+      # then tmpfiles/broker retention removes the receipt within one hour.
+      # Deleting it here can race that acknowledgement and leave a request
+      # eligible for duplicate processing after the next agent scan.
