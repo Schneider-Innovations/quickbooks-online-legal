@@ -285,14 +285,29 @@ jobs:
                 });
             let mergeCheck;
             try {
-              mergeCheck = await github.rest.checks.create({
-                ...context.repo,
-                name: 'ai-review/receipt',
-                head_sha: process.env.MERGE_SHA,
-                status: 'in_progress',
-                external_id: `ai-cli-review:merge:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:${process.env.MERGE_SHA}`,
-                output,
-              });
+              const mergeInvalidationId = `ai-review-invalidated:merge:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:${process.env.MERGE_SHA}`;
+              const existingMergeChecks = await github.paginate(
+                github.rest.checks.listForRef,
+                { ...context.repo, ref: process.env.MERGE_SHA, per_page: 100 },
+              );
+              const mergeInvalidation = existingMergeChecks.find((check) =>
+                check.name === 'ai-review/receipt' && check.external_id === mergeInvalidationId,
+              );
+              mergeCheck = mergeInvalidation
+                ? await github.rest.checks.update({
+                    ...context.repo,
+                    check_run_id: mergeInvalidation.id,
+                    status: 'in_progress',
+                    output,
+                  })
+                : await github.rest.checks.create({
+                    ...context.repo,
+                    name: 'ai-review/receipt',
+                    head_sha: process.env.MERGE_SHA,
+                    status: 'in_progress',
+                    external_id: `ai-cli-review:merge:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:${process.env.MERGE_SHA}`,
+                    output,
+                  });
             } catch {
               await github.rest.checks.update({
                 ...context.repo,
