@@ -24,14 +24,9 @@ permissions:
 
 concurrency:
   group: codex-review-receipt-${{ inputs.pr_number || github.event.pull_request.number }}
-  cancel-in-progress: >-
-    ${{
-      github.event_name == 'workflow_dispatch' ||
-      github.event.action == 'reopened' ||
-      github.event.action == 'synchronize' ||
-      github.event.action == 'converted_to_draft' ||
-      (github.event.action == 'unlabeled' && github.event.label.name == 'ready-for-final-review')
-    }}
+  # Only a new head supersedes an active review. Same-head label, draft, and
+  # reconciliation events must not cancel a job after it created receipt Checks.
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' && github.event.action == 'synchronize' }}
 
 jobs:
   invalidate-review:
@@ -115,7 +110,7 @@ jobs:
             await github.rest.checks.create({
               owner,
               repo,
-              name: 'ai-review/receipt-required',
+              name: 'ai-review/receipt',
               head_sha: pr.head.sha,
               status: 'completed',
               conclusion: 'action_required',
