@@ -95,6 +95,7 @@ jobs:
       # Keep receipt publication on the short-lived workflow token. The
       # dedicated token above never receives Checks permission or merge power.
       - name: Publish final-head review requirement
+        if: always()
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
           LABEL_REMOVED: ${{ steps.remove-stale-label.outputs.label_removed }}
@@ -103,38 +104,59 @@ jobs:
             const label = 'ready-for-final-review';
             const pr = context.payload.pull_request;
             const { owner, repo } = context.repo;
-            const externalId = `ai-review-invalidated:${pr.number}:${pr.head.sha}`;
-            const existingChecks = await github.paginate(
-              github.rest.checks.listForRef,
-              { owner, repo, ref: pr.head.sha, per_page: 100 },
-            );
-            const existing = existingChecks.find((check) =>
-              check.name === 'ai-review/receipt' && check.external_id === externalId,
-            );
-            const parameters = {
-              owner,
-              repo,
-              status: 'completed',
-              conclusion: 'action_required',
-              output: {
-                title: 'Final-head AI review required',
-                summary: process.env.LABEL_REMOVED === 'true'
-                  ? `Apply ${label} to the stable, non-draft PR when it is ready for final review.`
-                  : `The workflow could not remove ${label}; remove and reapply it to request final review.`,
-              },
+            const upsertInvalidation = async (sha, externalId) => {
+              const existingChecks = await github.paginate(
+                github.rest.checks.listForRef,
+                { owner, repo, ref: sha, per_page: 100 },
+              );
+              const existing = existingChecks.find((check) =>
+                check.name === 'ai-review/receipt' && check.external_id === externalId,
+              );
+              const parameters = {
+                owner,
+                repo,
+                status: 'completed',
+                conclusion: 'action_required',
+                output: {
+                  title: 'Final-head AI review required',
+                  summary: process.env.LABEL_REMOVED === 'true'
+                    ? `Apply ${label} to the stable, non-draft PR when it is ready for final review.`
+                    : `The workflow could not remove ${label}; remove and reapply it to request final review.`,
+                },
+              };
+              if (existing) {
+                await github.rest.checks.update({
+                  ...parameters,
+                  check_run_id: existing.id,
+                });
+              } else {
+                await github.rest.checks.create({
+                  ...parameters,
+                  name: 'ai-review/receipt',
+                  head_sha: sha,
+                  external_id: externalId,
+                });
+              }
             };
-            if (existing) {
-              await github.rest.checks.update({
-                ...parameters,
-                check_run_id: existing.id,
-              });
-            } else {
-              await github.rest.checks.create({
-                ...parameters,
-                name: 'ai-review/receipt',
-                head_sha: pr.head.sha,
-                external_id: externalId,
-              });
+            await upsertInvalidation(
+              pr.head.sha,
+              `ai-review-invalidated:${pr.number}:${pr.head.sha}`,
+            );
+            try {
+              const mergeSha = (await github.rest.git.getRef({
+                owner,
+                repo,
+                ref: `pull/${pr.number}/merge`,
+              })).data.object?.sha;
+              if (!/^[0-9a-f]{40}$/i.test(mergeSha || '')) {
+                throw new Error('merge ref did not resolve to a full SHA');
+              }
+              await upsertInvalidation(
+                mergeSha,
+                `ai-review-invalidated:merge:${pr.number}:${pr.head.sha}:${mergeSha}`,
+              );
+            } catch (error) {
+              core.setFailed(`AI_REVIEW_MERGE_INVALIDATION_FAILED:${error.status || error.message || 'unknown'}`);
             }
 
   request-and-verify-review:
