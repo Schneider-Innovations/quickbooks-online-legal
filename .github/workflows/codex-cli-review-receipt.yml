@@ -852,13 +852,28 @@ jobs:
               connectorStatus = 'stale';
               connectorReason = 'connector_context_changed';
             }
-            const finalClear = process.env.CLI_CLEAR === 'true' && connectorStatus === 'passed';
+            // A trusted exact-head Connector review may substitute only for an
+            // unusable CLI result. A complete CLI BLOCK is intentionally not
+            // escalated, while clean high-risk CLI results still require both
+            // reviewers to pass.
+            const connectorSubstitutionReasons = new Set([
+              'result_missing_or_malformed',
+              'result_contract_invalid',
+              'review_coverage_incomplete',
+              'result_too_large',
+              'decision_inconclusive',
+            ]);
+            const connectorSubstituted = connectorSubstitutionReasons.has(process.env.ESCALATION_REASON) &&
+              connectorStatus === 'passed';
+            const finalClear = connectorStatus === 'passed' &&
+              (process.env.CLI_CLEAR === 'true' || connectorSubstituted);
             const output = {
               schema_version: '1.0',
               mode: 'shadow',
               head_sha: headSha,
               merge_sha: mergeSha,
               cli_clear: process.env.CLI_CLEAR === 'true',
+              connector_substituted_for_unusable_cli: connectorSubstituted,
               cli_reason: process.env.CLI_REASON,
               escalation_reason: process.env.ESCALATION_REASON,
               connector_status: connectorStatus,
