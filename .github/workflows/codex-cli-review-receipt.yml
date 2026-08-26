@@ -863,7 +863,7 @@ jobs:
               'result_too_large',
               'decision_inconclusive',
             ]);
-            const connectorSubstituted = connectorSubstitutionReasons.has(process.env.ESCALATION_REASON) &&
+            const connectorSubstituted = connectorSubstitutionReasons.has(process.env.CLI_REASON) &&
               connectorStatus === 'passed';
             const finalClear = connectorStatus === 'passed' &&
               (process.env.CLI_CLEAR === 'true' || connectorSubstituted);
