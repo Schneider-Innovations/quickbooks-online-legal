@@ -751,7 +751,11 @@ jobs:
                       createdAt: comment.created_at,
                       login,
                       url: comment.html_url,
-                      reviewedSha: comment.commit_id,
+                      // GitHub may anchor a fresh inline finding to an older
+                      // line commit. Identity plus post-request creation time
+                      // is sufficient because every trusted inline comment is
+                      // conservatively treated as a finding below.
+                      reviewedSha: headSha,
                       inlineFindingUrls: [comment.html_url],
                     });
                   }
