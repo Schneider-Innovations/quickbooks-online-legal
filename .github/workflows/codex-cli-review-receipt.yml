@@ -714,6 +714,7 @@ jobs:
                     createdAt: review.submitted_at,
                     login: review.user?.login?.toLowerCase(),
                     url: review.html_url,
+                    inlineFindingUrls: [],
                   });
                 }
                 for (const comment of reviewComments) {
@@ -723,6 +724,7 @@ jobs:
                     reviewerLogins.has(comment.user?.login?.toLowerCase())
                   ) {
                     parent.body += `\n${comment.body || ''}`;
+                    parent.inlineFindingUrls.push(comment.html_url);
                   }
                 }
                 const candidates = [
@@ -778,7 +780,8 @@ jobs:
                   ) || null;
                 }
                 const finding = exactCandidates.find((candidate) =>
-                  /\[P[0-3]\]/i.test(candidate.body),
+                  candidate.inlineFindingUrls?.length > 0 ||
+                    /\[P[0-3](?:\s+Badge)?\]/i.test(candidate.body),
                 );
                 const clean = exactCandidates.find((candidate) =>
                   /no major issues found\.?/i.test(candidate.body) ||
@@ -791,7 +794,7 @@ jobs:
                 if (finding) {
                   connectorStatus = 'blocked';
                   connectorReason = 'connector_findings_present';
-                  evidenceUrl = finding.url;
+                  evidenceUrl = finding.inlineFindingUrls?.[0] || finding.url;
                   break;
                 }
                 if (clean || cleanReaction) {
