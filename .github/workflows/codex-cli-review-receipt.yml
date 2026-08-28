@@ -817,8 +817,14 @@ jobs:
                   candidate.inlineFindingUrls?.length > 0 ||
                     /\[P[0-3](?:\s+Badge)?\]/i.test(candidate.body),
                 );
+                // Codex currently emits both the requested contract phrase and
+                // the semantically equivalent "Didn't find any major issues."
+                // template. Keep this bounded to known clean phrases; arbitrary
+                // prose must remain fail-closed as connector_format_invalid.
+                const cleanReviewPattern =
+                  /(?:no major issues found|did(?: not|n['’]t) find any major issues)\.?/i;
                 const clean = exactCandidates.find((candidate) =>
-                  /no major issues found\.?/i.test(candidate.body) ||
+                  cleanReviewPattern.test(candidate.body) ||
                     /未发现.{0,12}(重大|主要).{0,8}问题/i.test(candidate.body),
                 );
                 // Aggregate the parent review and every inline review comment.
