@@ -263,7 +263,7 @@ jobs:
             const invalidationPrefix = `ai-review-invalidated:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:`;
             const existingChecks = await github.paginate(
               github.rest.checks.listForRef,
-              { ...context.repo, ref: process.env.HEAD_SHA, per_page: 100 },
+              { ...context.repo, ref: process.env.HEAD_SHA, per_page: 100, filter: 'all' },
             );
             const invalidation = existingChecks.find((check) =>
               check.name === 'ai-review/receipt' &&
@@ -290,7 +290,7 @@ jobs:
               const mergeInvalidationPrefix = `ai-review-invalidated:merge:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:${process.env.MERGE_SHA}:`;
               const existingMergeChecks = await github.paginate(
                 github.rest.checks.listForRef,
-                { ...context.repo, ref: process.env.MERGE_SHA, per_page: 100 },
+                { ...context.repo, ref: process.env.MERGE_SHA, per_page: 100, filter: 'all' },
               );
               const mergeInvalidation = existingMergeChecks.find((check) =>
                 check.name === 'ai-review/receipt' &&
@@ -970,9 +970,9 @@ jobs:
       - prepare-cli-review
       - await-cli-review
     if: always()
-    runs-on:
-      group: code-review
-      labels: [self-hosted, code-review, cli-review, shadow-only]
+    # This base-owned, token-only cleanup must not wait for scarce review
+    # compute after the Receipt has already reached a terminal state.
+    runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
       - name: End matching non-gating request contract
@@ -1004,7 +1004,7 @@ jobs:
             const externalId = `ai-review-request:${pr.number}:${headSha}:${context.runId}`;
             const checks = await github.paginate(
               github.rest.checks.listForRef,
-              { ...context.repo, ref: headSha, per_page: 100 },
+              { ...context.repo, ref: headSha, per_page: 100, filter: 'all' },
             );
             const matching = checks.filter((check) =>
               check.name === 'ai-review/request' && check.external_id === externalId,
