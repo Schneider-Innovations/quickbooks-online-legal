@@ -818,15 +818,23 @@ jobs:
                     /\[P[0-3](?:\s+Badge)?\]/i.test(candidate.body),
                 );
                 // Codex currently emits both the requested contract phrase and
-                // the semantically equivalent "Didn't find any major issues."
-                // template. Keep this bounded to known clean phrases; arbitrary
-                // prose must remain fail-closed as connector_format_invalid.
-                const cleanReviewPattern =
-                  /(?:no major issues found|did(?: not|n['’]t) find any major issues)\.?/i;
-                const clean = exactCandidates.find((candidate) =>
-                  cleanReviewPattern.test(candidate.body) ||
-                    /未发现.{0,12}(重大|主要).{0,8}问题/i.test(candidate.body),
-                );
+                // a small set of semantically equivalent clean templates. The
+                // verdict must occupy the complete first substantive line and
+                // be followed immediately by the exact reviewed-commit line;
+                // qualified, negated, or mixed prose remains fail-closed.
+                const cleanReviewLinePattern =
+                  /^(?:Codex Review:\s*)?(?:no major issues found|did(?: not|n['’]t) find any major issues)\.(?:\s+(?:Another round soon, please!|Already looking forward to the next diff\.|Delightful!|Chef['’]s kiss\.|:\+1:))?$/i;
+                const reviewedCommitLinePattern =
+                  /^\*\*Reviewed commit:\*\*\s*`[0-9a-f]{7,40}`$/i;
+                const isCleanReview = (candidate) => {
+                  const substantiveLines = candidate.body.split(/\r?\n/)
+                    .map((line) => line.trim()).filter(Boolean);
+                  return substantiveLines.length >= 2 &&
+                    (cleanReviewLinePattern.test(substantiveLines[0]) ||
+                      /未发现.{0,12}(重大|主要).{0,8}问题/i.test(substantiveLines[0])) &&
+                    reviewedCommitLinePattern.test(substantiveLines[1]);
+                };
+                const clean = exactCandidates.find(isCleanReview);
                 // Aggregate the parent review and every inline review comment.
                 // Findings always win, regardless of API ordering or an earlier
                 // clean comment. A clean signal must survive another poll so a
