@@ -205,7 +205,7 @@ jobs:
             for (const sha of refs) {
               const existingChecks = await github.paginate(
                 github.rest.checks.listForRef,
-                { owner, repo, ref: sha, per_page: 100 },
+                { owner, repo, ref: sha, per_page: 100, filter: 'all' },
               );
               const existing = existingChecks.filter((check) =>
                 check.name === 'ai-review/request' &&
@@ -271,7 +271,7 @@ jobs:
             const upsertInvalidation = async (sha, externalIdPrefix) => {
               const existingChecks = await github.paginate(
                 github.rest.checks.listForRef,
-                { owner, repo, ref: sha, per_page: 100 },
+                { owner, repo, ref: sha, per_page: 100, filter: 'all' },
               );
               const existing = existingChecks.find((check) =>
                 check.name === 'ai-review/receipt' &&
