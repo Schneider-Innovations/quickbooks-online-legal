@@ -58,7 +58,7 @@ jobs:
           PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || 0 }}
           REQUIRED_LABEL: ready-for-final-review
           REQUESTER_LOGIN: ${{ vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231' }}
-          REVIEW_WORKFLOW_REF: 9a4879d0ce40d9cbd8a9c2b5daad045d70d371b8 # pragma: allowlist secret
+          REVIEW_WORKFLOW_REF: 9747d1b070ea03646c051244c66f2c35d6ce8464 # pragma: allowlist secret
         with:
           script: |
             const requestedPrNumber = Number(process.env.PR_NUMBER);
