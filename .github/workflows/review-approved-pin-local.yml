@@ -28,8 +28,10 @@ jobs:
       APPROVED_LOCAL_WORKFLOW_BLOBS: |
         Schneider-Innovations/amazon-store-outpost-legal=b3fa292f8828abfa68bc87e3fc6cd13c2f2bbbd8
         Schneider-Innovations/amazon-store-outpost-legal=e857954a46e6f26c4ebccafb461efa19b47ffb63
+        Schneider-Innovations/amazon-store-outpost-legal=3dd7abf0c29d65133e5a1d3349119ad58899cde9
         Schneider-Innovations/quickbooks-online-legal=b3fa292f8828abfa68bc87e3fc6cd13c2f2bbbd8
         Schneider-Innovations/quickbooks-online-legal=e857954a46e6f26c4ebccafb461efa19b47ffb63
+        Schneider-Innovations/quickbooks-online-legal=3dd7abf0c29d65133e5a1d3349119ad58899cde9
       APPROVED_REUSABLE_REFS: |
         0a32c354464b4289ad7c791434ac0ded5dfa00f5
         3aed02cdf707b465184382eb301abe542b0e36ff
