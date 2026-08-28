@@ -6,6 +6,7 @@ on:
       - labeled
       - unlabeled
       - reopened
+      - closed
       - synchronize
       - converted_to_draft
   workflow_dispatch:
@@ -29,13 +30,102 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' && github.event.action == 'synchronize' }}
 
 jobs:
+  # This is a scheduling contract, not an approval.  It is deliberately a
+  # separate Check name from ai-review/receipt: only the latter may satisfy
+  # the protected exact-head review rule.
+  publish-review-request:
+    if: >-
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.base.ref == 'main' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.draft == false &&
+       github.event.action == 'labeled' &&
+       github.event.label.name == 'ready-for-final-review' &&
+       github.actor == (vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231')) ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/main' &&
+       inputs.pr_number > 0 &&
+       github.actor == (vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231'))
+    runs-on: ${{ fromJSON(vars.CI_GENERAL_RUNS_ON || vars.CI_RUNS_ON || '["self-hosted","Linux","X64","linux-general"]') }}
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Publish non-gating review scheduling contract
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || 0 }}
+          REQUIRED_LABEL: ready-for-final-review
+          REQUESTER_LOGIN: ${{ vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231' }}
+          REVIEW_WORKFLOW_REF: 9a4879d0ce40d9cbd8a9c2b5daad045d70d371b8 # pragma: allowlist secret
+        with:
+          script: |
+            const requestedPrNumber = Number(process.env.PR_NUMBER);
+            const pr = context.payload.pull_request || (
+              requestedPrNumber > 0
+                ? (await github.rest.pulls.get({ ...context.repo, pull_number: requestedPrNumber })).data
+                : null
+            );
+            if (!pr) {
+              core.setFailed('AI_REVIEW_REQUEST_PR_CONTEXT_REQUIRED');
+              return;
+            }
+            const { owner, repo } = context.repo;
+            const label = process.env.REQUIRED_LABEL;
+            const requester = process.env.REQUESTER_LOGIN.toLowerCase();
+            if (
+              pr.state !== 'open' ||
+              pr.draft ||
+              pr.base.ref !== 'main' ||
+              pr.head.repo?.full_name !== `${owner}/${repo}` ||
+              !(pr.labels || []).some((candidate) => candidate.name === label) ||
+              context.actor.toLowerCase() !== requester
+            ) {
+              core.setFailed('AI_REVIEW_REQUEST_SCOPE_FORBIDDEN');
+              return;
+            }
+            const headSha = pr.head.sha.toLowerCase();
+            const baseSha = pr.base.sha.toLowerCase();
+            const now = new Date();
+            const request = {
+              schema: 'ai-review-request/v1',
+              state: 'waiting_for_runner',
+              repository: `${owner}/${repo}`,
+              pr_number: pr.number,
+              base_sha: baseSha,
+              head_sha: headSha,
+              request_generation: String(context.runId),
+              idempotency_key: `${owner}/${repo}:${pr.number}:${baseSha}:${headSha}:${process.env.REVIEW_WORKFLOW_REF}:${context.runId}`,
+              accepted_at: now.toISOString(),
+              next_check_after: new Date(now.getTime() + 5 * 60 * 1000).toISOString(),
+              escalate_after: new Date(now.getTime() + 10 * 60 * 1000).toISOString(),
+              expected_completion_by: null,
+              estimate_confidence: 'unknown',
+              terminal: false,
+            };
+            await github.rest.checks.create({
+              owner,
+              repo,
+              name: 'ai-review/request',
+              head_sha: headSha,
+              status: 'in_progress',
+              external_id: `ai-review-request:${pr.number}:${headSha}:${context.runId}`,
+              output: {
+                title: 'AI review waiting for Runner capacity',
+                summary: 'The review request was accepted. Follow up after the published next_check_after time; do not dispatch a duplicate request.',
+                text: `\`\`\`json\n${JSON.stringify(request)}\n\`\`\``,
+              },
+            });
+
   invalidate-review:
     if: >-
       github.event_name == 'pull_request_target' &&
       github.event.pull_request.base.ref == 'main' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      (
-        github.event.action == 'reopened' ||
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        (
+          github.event.action == 'closed' ||
+          github.event.action == 'reopened' ||
         github.event.action == 'synchronize' ||
         github.event.action == 'converted_to_draft' ||
         (github.event.action == 'unlabeled' && github.event.label.name == 'ready-for-final-review') ||
@@ -44,7 +134,10 @@ jobs:
          !(github.event.pull_request.draft == false &&
            github.actor == (vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231')))
       )
-    runs-on: ${{ fromJSON(vars.CI_GENERAL_RUNS_ON || vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    # Invalidating a stale receipt is trusted-base housekeeping. Keep it on
+    # the ordinary self-hosted pool; a missing repository variable must never
+    # silently fall back to billed GitHub-hosted capacity.
+    runs-on: ${{ fromJSON(vars.CI_GENERAL_RUNS_ON || vars.CI_RUNS_ON || '["self-hosted","Linux","X64","linux-general"]') }}
     permissions:
       checks: write
       contents: read
@@ -92,9 +185,80 @@ jobs:
             }
             core.setOutput('label_removed', labelRemoved ? 'true' : 'false');
 
-      # Keep receipt publication on the short-lived workflow token. The
-      # dedicated token above never receives Checks permission or merge power.
-      - name: Publish final-head review requirement
+      # End the non-gating scheduling record independently from the merge gate.
+      - name: End invalidated review scheduling contract
+        if: always()
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const state = context.payload.action === 'synchronize'
+              ? 'superseded'
+              : 'not_requested';
+            const reason = context.payload.action === 'synchronize'
+              ? 'The pull request head changed; apply ready-for-final-review to request review of the new head.'
+              : 'Final-head review is not currently requested for this pull request.';
+            const refs = new Set([pr.head.sha, context.payload.before].filter((sha) =>
+              /^[0-9a-f]{40}$/i.test(sha || ''),
+            ));
+            for (const sha of refs) {
+              const existingChecks = await github.paginate(
+                github.rest.checks.listForRef,
+                { owner, repo, ref: sha, per_page: 100 },
+              );
+              const existing = existingChecks.filter((check) =>
+                check.name === 'ai-review/request' &&
+                  check.status !== 'completed' &&
+                  check.external_id?.startsWith(`ai-review-request:${pr.number}:`),
+              );
+              const request = {
+                schema: 'ai-review-request/v1',
+                state,
+                repository: `${owner}/${repo}`,
+                pr_number: pr.number,
+                base_sha: pr.base.sha.toLowerCase(),
+                head_sha: sha.toLowerCase(),
+                request_generation: String(context.runId),
+                terminal: true,
+                reason,
+                transitioned_at: new Date().toISOString(),
+              };
+              const parameters = {
+                owner,
+                repo,
+                status: 'completed',
+                conclusion: 'neutral',
+                output: {
+                  title: state === 'superseded'
+                    ? 'AI review request superseded'
+                    : 'AI review not requested',
+                  summary: reason,
+                  text: `\`\`\`json\n${JSON.stringify(request)}\n\`\`\``,
+                },
+              };
+              if (existing.length > 0) {
+                for (const check of existing) {
+                  await github.rest.checks.update({
+                    ...parameters,
+                    check_run_id: check.id,
+                  });
+                }
+              } else if (sha.toLowerCase() === pr.head.sha.toLowerCase()) {
+                await github.rest.checks.create({
+                  ...parameters,
+                  name: 'ai-review/request',
+                  head_sha: sha,
+                  external_id: `ai-review-request:${pr.number}:${sha}:${context.runId}`,
+                });
+              }
+                }
+
+      # A previously successful receipt on the same SHA must stop authorizing
+      # merge when the PR closes, reopens, becomes draft, or loses its final
+      # review label. Keep the old fail-closed invalidation as a separate Check
+      # operation; Request terminalization alone cannot revoke a Receipt PASS.
+      - name: Invalidate stale final-head review receipt
         if: always()
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
@@ -161,6 +325,7 @@ jobs:
             }
 
   request-and-verify-review:
+    needs: publish-review-request
     if: >-
       (github.event_name == 'pull_request_target' &&
        github.event.pull_request.base.ref == 'main' &&
@@ -178,11 +343,9 @@ jobs:
       contents: read
       issues: read
       pull-requests: read
-    # Use the same immutable control-plane reference as every consumer
-    # repository. A relative call is not reliably matchable by GitHub's
-    # restricted runner-group workflow allowlist, which would leave this
-    # trust-root repository permanently queued. The exact commit below is
-    # separately allowlisted; advancing it requires a reviewed PR.
+    # Public legal repositories retain a base-owned local reusable workflow.
+    # Its code is reviewed in the same PR as this caller and remains subject to
+    # the restricted runner-group workflow allowlist for this exact path.
     uses: ./.github/workflows/codex-cli-review-receipt.yml
     with:
       # workflow_dispatch inputs arrive as strings. Convert explicitly so the
