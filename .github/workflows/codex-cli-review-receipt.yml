@@ -263,7 +263,7 @@ jobs:
             const invalidationPrefix = `ai-review-invalidated:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:`;
             const existingChecks = await github.paginate(
               github.rest.checks.listForRef,
-              { ...context.repo, ref: process.env.HEAD_SHA, per_page: 100 },
+              { ...context.repo, ref: process.env.HEAD_SHA, per_page: 100, filter: 'all' },
             );
             const invalidation = existingChecks.find((check) =>
               check.name === 'ai-review/receipt' &&
@@ -290,7 +290,7 @@ jobs:
               const mergeInvalidationPrefix = `ai-review-invalidated:merge:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:${process.env.MERGE_SHA}:`;
               const existingMergeChecks = await github.paginate(
                 github.rest.checks.listForRef,
-                { ...context.repo, ref: process.env.MERGE_SHA, per_page: 100 },
+                { ...context.repo, ref: process.env.MERGE_SHA, per_page: 100, filter: 'all' },
               );
               const mergeInvalidation = existingMergeChecks.find((check) =>
                 check.name === 'ai-review/receipt' &&
@@ -963,3 +963,98 @@ jobs:
       # then tmpfiles/broker retention removes the receipt within one hour.
       # Deleting it here can race that acknowledgement and leave a request
       # eligible for duplicate processing after the next agent scan.
+
+  finalize-review-request:
+    name: Finalize review scheduling request
+    needs:
+      - prepare-cli-review
+      - await-cli-review
+    if: always()
+    # This base-owned, token-only cleanup must not wait for scarce review
+    # compute after the Receipt has already reached a terminal state.
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: End matching non-gating request contract
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          PR_NUMBER: ${{ needs.prepare-cli-review.outputs.pr_number || inputs.pr_number }}
+          HEAD_SHA: ${{ needs.prepare-cli-review.outputs.head_sha }}
+          PREPARE_RESULT: ${{ needs.prepare-cli-review.result }}
+          RECEIPT_RESULT: ${{ needs.await-cli-review.result }}
+        with:
+          retries: 3
+          retry-exempt-status-codes: 400,401,403,404,422
+          script: |
+            const requestedPrNumber = Number(process.env.PR_NUMBER);
+            const pr = context.payload.pull_request || (
+              requestedPrNumber > 0
+                ? (await github.rest.pulls.get({ ...context.repo, pull_number: requestedPrNumber })).data
+                : null
+            );
+            if (!pr) {
+              core.setFailed('AI_REVIEW_REQUEST_FINALIZE_PR_CONTEXT_REQUIRED');
+              return;
+            }
+            const headSha = (process.env.HEAD_SHA || pr.head.sha || '').toLowerCase();
+            if (!/^[0-9a-f]{40}$/.test(headSha)) {
+              core.setFailed('AI_REVIEW_REQUEST_FINALIZE_HEAD_INVALID');
+              return;
+            }
+            const externalId = `ai-review-request:${pr.number}:${headSha}:${context.runId}`;
+            const checks = await github.paginate(
+              github.rest.checks.listForRef,
+              { ...context.repo, ref: headSha, per_page: 100, filter: 'all' },
+            );
+            const matching = checks.filter((check) =>
+              check.name === 'ai-review/request' && check.external_id === externalId,
+            );
+            if (matching.length === 0) {
+              core.notice('AI_REVIEW_REQUEST_FINALIZE_NOT_PUBLISHED');
+              return;
+            }
+            if (matching.length !== 1) {
+              core.setFailed('AI_REVIEW_REQUEST_FINALIZE_IDENTITY_AMBIGUOUS');
+              return;
+            }
+            const requestCheck = matching[0];
+            if (requestCheck.status === 'completed') {
+              core.notice('AI_REVIEW_REQUEST_FINALIZE_ALREADY_TERMINAL');
+              return;
+            }
+            const prepareResult = process.env.PREPARE_RESULT;
+            const receiptResult = process.env.RECEIPT_RESULT;
+            const state = receiptResult === 'success'
+              ? 'receipt_published'
+              : prepareResult !== 'success'
+                ? 'preparation_failed'
+                : receiptResult === 'cancelled'
+                  ? 'review_cancelled'
+                  : 'receipt_unavailable';
+            const request = {
+              schema: 'ai-review-request/v1',
+              state,
+              repository: `${context.repo.owner}/${context.repo.repo}`,
+              pr_number: pr.number,
+              base_sha: pr.base.sha.toLowerCase(),
+              head_sha: headSha,
+              request_generation: String(context.runId),
+              terminal: true,
+              prepare_result: prepareResult,
+              receipt_result: receiptResult,
+              transitioned_at: new Date().toISOString(),
+            };
+            await github.rest.checks.update({
+              ...context.repo,
+              check_run_id: requestCheck.id,
+              status: 'completed',
+              conclusion: 'neutral',
+              completed_at: new Date().toISOString(),
+              output: {
+                title: receiptResult === 'success'
+                  ? 'AI review request completed'
+                  : 'AI review request ended without a successful receipt',
+                summary: 'The scheduling contract is terminal. ai-review/receipt remains the sole review verdict.',
+                text: `\`\`\`json\n${JSON.stringify(request)}\n\`\`\``,
+              },
+            });
