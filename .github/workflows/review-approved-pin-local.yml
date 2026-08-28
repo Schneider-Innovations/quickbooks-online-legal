@@ -27,7 +27,9 @@ jobs:
       # protected-base local mirrors are admitted only by exact Git blob ID.
       APPROVED_LOCAL_WORKFLOW_BLOBS: |
         Schneider-Innovations/amazon-store-outpost-legal=b3fa292f8828abfa68bc87e3fc6cd13c2f2bbbd8
+        Schneider-Innovations/amazon-store-outpost-legal=e857954a46e6f26c4ebccafb461efa19b47ffb63
         Schneider-Innovations/quickbooks-online-legal=b3fa292f8828abfa68bc87e3fc6cd13c2f2bbbd8
+        Schneider-Innovations/quickbooks-online-legal=e857954a46e6f26c4ebccafb461efa19b47ffb63
       APPROVED_REUSABLE_REFS: |
         0a32c354464b4289ad7c791434ac0ded5dfa00f5
         3aed02cdf707b465184382eb301abe542b0e36ff
@@ -63,10 +65,9 @@ jobs:
               name, blob = entry.split("=", 2)
               [name.to_s.downcase, blob.to_s.downcase]
             }
-          if local_entries.map(&:first).uniq.length != local_entries.length
-            abort("duplicate approved local workflow repository")
-          end
-          local_approved = local_entries.to_h
+          local_approved = local_entries.group_by(&:first).transform_values { |entries|
+            entries.map(&:last).uniq
+          }
 
           unless repository.match?(%r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z})
             abort("invalid head repository context")
@@ -82,9 +83,9 @@ jobs:
           }
             abort("invalid central approved revision list")
           end
-          if local_approved.empty? || local_approved.any? { |name, blob|
+          if local_approved.empty? || local_approved.any? { |name, blobs|
             !name.match?(%r{\A[a-z0-9_.-]+/[a-z0-9_.-]+\z}) ||
-              !blob.match?(/\A[0-9a-f]{40}\z/)
+              blobs.empty? || blobs.any? { |blob| !blob.match?(/\A[0-9a-f]{40}\z/) }
           }
             abort("invalid approved local workflow blob map")
           end
@@ -128,8 +129,8 @@ jobs:
 
           jobs = document.is_a?(Hash) ? document["jobs"] : nil
           abort("proposed caller jobs must be a mapping") unless jobs.is_a?(Hash)
-          local_blob = local_approved[target_repository.downcase]
-          if local_blob
+          local_blobs = local_approved[target_repository.downcase]
+          if local_blobs
             local_jobs = jobs.values.select { |job|
               job.is_a?(Hash) &&
                 job["uses"] == "./.github/workflows/codex-cli-review-receipt.yml"
@@ -166,7 +167,7 @@ jobs:
             end
             local_payload, = fetch_file.call(local_workflow_path)
             actual_blob = local_payload.fetch("sha", "").downcase
-            unless actual_blob == local_blob
+            unless local_blobs.include?(actual_blob)
               abort("local review workflow blob #{actual_blob} is not centrally approved")
             end
             puts("approved local review workflow blob: #{actual_blob}")
