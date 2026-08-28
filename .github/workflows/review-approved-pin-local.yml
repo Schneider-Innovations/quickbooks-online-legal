@@ -26,8 +26,8 @@ jobs:
       # Public repositories cannot call the private reusable workflow. Their
       # protected-base local mirrors are admitted only by exact Git blob ID.
       APPROVED_LOCAL_WORKFLOW_BLOBS: |
-        Schneider-Innovations/amazon-store-outpost-legal=b3fa292f8828abfa68bc87e3fc6cd13c2f2bbbd8
-        Schneider-Innovations/quickbooks-online-legal=b3fa292f8828abfa68bc87e3fc6cd13c2f2bbbd8
+        Schneider-Innovations/amazon-store-outpost-legal=87f3727d62af63e2fb43dc543892ddab903a93c1
+        Schneider-Innovations/quickbooks-online-legal=87f3727d62af63e2fb43dc543892ddab903a93c1
       APPROVED_REUSABLE_REFS: |
         0a32c354464b4289ad7c791434ac0ded5dfa00f5
         3aed02cdf707b465184382eb301abe542b0e36ff
