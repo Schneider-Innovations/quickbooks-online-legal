@@ -14,7 +14,7 @@ const reviewedCommitLinePattern = /^\*\*Reviewed commit:\*\*\s*`[0-9a-f]{7,40}`$
 const isCleanReview = (body) => {
   const substantiveLines = body.split(/\r?\n/)
     .map((line) => line.trim()).filter(Boolean);
-  return substantiveLines.length >= 2 &&
+  return substantiveLines.length === 2 &&
     cleanReviewLinePattern.test(substantiveLines[0]) &&
     reviewedCommitLinePattern.test(substantiveLines[1]);
 };
@@ -40,6 +40,7 @@ test('rejects unrecognized or ambiguous clean prose', () => {
     "Codex Review: Didn't find any major issues. Found a critical authentication flaw.\n\n**Reviewed commit:** \`abcdef1234\`",
     "Codex Review: Didn't find any major issues.\nFound a critical authentication flaw.\n**Reviewed commit:** \`abcdef1234\`",
     "Codex Review: Didn't find any major issues in the documentation.\n\n**Reviewed commit:** \`abcdef1234\`",
+    "Codex Review: Didn't find any major issues.\n\n**Reviewed commit:** \`abcdef1234\`\nI found an authentication bypass.",
     "Codex Review: Didn't find any major issues.\n\nReviewed commit: abcdef1234",
   ]) {
     assert.equal(isCleanReview(body), false);

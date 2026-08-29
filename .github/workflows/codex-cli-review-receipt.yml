@@ -829,7 +829,7 @@ jobs:
                 const isCleanReview = (candidate) => {
                   const substantiveLines = candidate.body.split(/\r?\n/)
                     .map((line) => line.trim()).filter(Boolean);
-                  return substantiveLines.length >= 2 &&
+                  return substantiveLines.length === 2 &&
                     (cleanReviewLinePattern.test(substantiveLines[0]) ||
                       /未发现.{0,12}(重大|主要).{0,8}问题/i.test(substantiveLines[0])) &&
                     reviewedCommitLinePattern.test(substantiveLines[1]);
