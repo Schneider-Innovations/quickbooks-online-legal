@@ -27,13 +27,7 @@ jobs:
       # protected-base local mirrors are admitted only by exact Git blob ID.
       # Bootstrap preserves older protected-base blobs until the final lifecycle PR proves the anchored parser.
       APPROVED_LOCAL_WORKFLOW_BLOBS: |
-        Schneider-Innovations/amazon-store-outpost-legal=b3fa292f8828abfa68bc87e3fc6cd13c2f2bbbd8
-        Schneider-Innovations/amazon-store-outpost-legal=e857954a46e6f26c4ebccafb461efa19b47ffb63
-        Schneider-Innovations/amazon-store-outpost-legal=3dd7abf0c29d65133e5a1d3349119ad58899cde9
         Schneider-Innovations/amazon-store-outpost-legal=0b116d39ad109ab746fd60ce2c8118ff74d299f7
-        Schneider-Innovations/quickbooks-online-legal=b3fa292f8828abfa68bc87e3fc6cd13c2f2bbbd8
-        Schneider-Innovations/quickbooks-online-legal=e857954a46e6f26c4ebccafb461efa19b47ffb63
-        Schneider-Innovations/quickbooks-online-legal=3dd7abf0c29d65133e5a1d3349119ad58899cde9
         Schneider-Innovations/quickbooks-online-legal=0b116d39ad109ab746fd60ce2c8118ff74d299f7
       APPROVED_REUSABLE_REFS: |
         0a32c354464b4289ad7c791434ac0ded5dfa00f5
