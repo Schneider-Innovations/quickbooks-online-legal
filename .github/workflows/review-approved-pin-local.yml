@@ -35,6 +35,7 @@ jobs:
         Schneider-Innovations/quickbooks-online-legal=e857954a46e6f26c4ebccafb461efa19b47ffb63
         Schneider-Innovations/quickbooks-online-legal=3dd7abf0c29d65133e5a1d3349119ad58899cde9
         Schneider-Innovations/quickbooks-online-legal=0b116d39ad109ab746fd60ce2c8118ff74d299f7
+        Schneider-Innovations/quickbooks-online-legal=f4df8649582b17f602fda19c37ca624ff1e92c88
       APPROVED_REUSABLE_REFS: |
         0a32c354464b4289ad7c791434ac0ded5dfa00f5
         3aed02cdf707b465184382eb301abe542b0e36ff
@@ -156,9 +157,25 @@ jobs:
                inputs.pr_number > 0 &&
                github.actor == (vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231'))
             CONDITION
+            expected_generation_condition = <<~'CONDITION'.split.join(" ")
+              needs.publish-review-request.outputs.request_accepted == 'true' &&
+              ((github.event_name == 'pull_request_target' &&
+               github.event.pull_request.base.ref == 'main' &&
+               github.event.pull_request.head.repo.full_name == github.repository &&
+               github.event.pull_request.draft == false &&
+               github.event.action == 'labeled' &&
+               github.event.label.name == 'ready-for-final-review' &&
+               github.actor == (vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231')) ||
+              (github.event_name == 'repository_dispatch' &&
+               github.event.action == 'codex-review-reconcile' &&
+               github.event.client_payload.pr_number > 0 &&
+               toJSON(github.event.client_payload.pr_number) == format('{0}', github.event.client_payload.pr_number) &&
+               format('{0}', github.event.client_payload.pr_number) != 'true' &&
+               github.actor == (vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231')))
+            CONDITION
             actual_local_condition = local_job["if"]
-            unless actual_local_condition.is_a?(String) &&
-                   actual_local_condition.split.join(" ") == expected_local_condition
+            normalized_local_condition = actual_local_condition.is_a?(String) ? actual_local_condition.split.join(" ") : nil
+            unless [expected_local_condition, expected_generation_condition].include?(normalized_local_condition)
               abort("local review caller condition is not the protected trigger")
             end
             secrets = local_job["secrets"]
