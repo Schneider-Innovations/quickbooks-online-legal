@@ -23,7 +23,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: codex-review-receipt-${{ inputs.pr_number || github.event.pull_request.number }}
+  group: codex-review-receipt-${{ inputs.pr_number || github.event.pull_request.number }}-${{ github.event.pull_request.head.sha || github.run_id }}-${{ github.run_attempt }}
   # Only a new head supersedes an active review. Same-head label, draft, and
   # reconciliation events must not cancel a job after it created receipt Checks.
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' && github.event.action == 'synchronize' }}
