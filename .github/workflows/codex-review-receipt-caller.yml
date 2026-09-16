@@ -167,7 +167,11 @@ jobs:
               const latest = [...nodes].reverse().find(node => node.label?.name === 'ready-for-final-review');
               // Same-second timestamps cannot establish that this event precedes the new
               // label. Preserve the label and let exact-head receipt admission decide.
-              if (latest?.__typename === 'LabeledEvent' && Date.parse(latest.createdAt) >= eventAt) {
+              const labelAt = Date.parse(latest?.createdAt || '');
+              // A rejected labeled event must still revoke its own unauthorized/draft
+              // request. Only a strictly later label may supersede that event.
+              if (latest?.__typename === 'LabeledEvent' &&
+                  (labelAt > eventAt || (labelAt === eventAt && action !== 'labeled'))) {
                 core.setOutput('current', 'false');
                 core.notice('AI_REVIEW_NEWER_READINESS_LABEL_PRESERVED');
               }
