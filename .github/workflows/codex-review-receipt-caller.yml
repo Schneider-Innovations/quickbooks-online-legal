@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   admit-review-request:
-    runs-on: ${{ fromJSON(vars.CI_GENERAL_RUNS_ON || vars.CI_RUNS_ON || '["self-hosted","Linux","X64","linux-general"]') }}
+    runs-on: ${{ fromJSON(vars.CI_GENERAL_RUNS_ON || vars.CI_RUNS_ON || (github.event.repository.private == false && '["ubuntu-latest"]' || '["self-hosted","Linux","X64","linux-general"]')) }}
     timeout-minutes: 5
     concurrency:
       group: review-request-admission-${{ github.repository }}-${{ github.event.pull_request.number || github.event.client_payload.pr_number || github.event.inputs.pr_number }}
