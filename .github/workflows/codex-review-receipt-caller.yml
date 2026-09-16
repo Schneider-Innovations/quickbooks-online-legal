@@ -132,10 +132,51 @@ jobs:
       issues: read
       pull-requests: read
     steps:
+      - name: Ignore obsolete invalidation events
+        id: invalidation-current
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        with:
+          retries: 0
+          script: |
+            // A delayed close/reopen/synchronize event must not erase a later request.
+            // Unknown API state preserves the original fail-closed invalidation behavior.
+            core.setOutput('current', 'true');
+            const event = context.payload.pull_request;
+            const live = (await github.rest.pulls.get({ ...context.repo, pull_number: event.number })).data;
+            const action = context.payload.action;
+            const obsolete = live.head.sha !== event.head.sha ||
+              (action === 'closed' && live.state !== 'closed') ||
+              (action === 'converted_to_draft' && !live.draft);
+            if (obsolete) {
+              core.setOutput('current', 'false');
+              core.notice('AI_REVIEW_OLD_INVALIDATION_EVENT_IGNORED');
+              return;
+            }
+            const eventAt = Date.parse(event.updated_at || '');
+            if (!Number.isFinite(eventAt)) throw new Error('INVALIDATION_EVENT_TIME_REQUIRED');
+            if (live.labels.some(label => label.name === 'ready-for-final-review')) {
+              const result = await github.graphql(`query($owner:String!,$repo:String!,$number:Int!) {
+                repository(owner:$owner,name:$repo) { pullRequest(number:$number) {
+                  timelineItems(last:50,itemTypes:[LABELED_EVENT,UNLABELED_EVENT]) {
+                    nodes { __typename ... on LabeledEvent { createdAt label { name } }
+                      ... on UnlabeledEvent { createdAt label { name } } }
+                  }
+                } }
+              }`, { ...context.repo, number: event.number });
+              const nodes = result.repository.pullRequest.timelineItems.nodes;
+              const latest = [...nodes].reverse().find(node => node.label?.name === 'ready-for-final-review');
+              // Same-second timestamps cannot establish that this event precedes the new
+              // label. Preserve the label and let exact-head receipt admission decide.
+              if (latest?.__typename === 'LabeledEvent' && Date.parse(latest.createdAt) >= eventAt) {
+                core.setOutput('current', 'false');
+                core.notice('AI_REVIEW_NEWER_READINESS_LABEL_PRESERVED');
+              }
+            }
       # Organization policy keeps GITHUB_TOKEN read-only. This narrow token is
       # repository-scoped and used only to remove a stale readiness label; no
       # pull-request code is checked out or executed by this base-owned job.
       - name: Remove stale final-head review label
+        if: (always()) && steps.invalidation-current.outputs.current == 'true'
         id: remove-stale-label
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
@@ -176,7 +217,7 @@ jobs:
       # Keep receipt publication on the short-lived workflow token. The
       # dedicated token above never receives Checks permission or merge power.
       - name: Publish final-head review requirement
-        if: always()
+        if: (always()) && steps.invalidation-current.outputs.current == 'true'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
           LABEL_REMOVED: ${{ steps.remove-stale-label.outputs.label_removed }}
