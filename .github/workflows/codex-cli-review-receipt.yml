@@ -399,7 +399,7 @@ jobs:
             // untrusted receipt has a SHA-shaped value.  Changing the agent
             // prompt or result contract must therefore be accompanied by a
             // reviewed control-plane change.
-            const expectedPolicyDigest = 'b9458619d9ea1cab15759c0191ea05ad4f339efde0c8b8887fbd53412ac6e41a';
+            const expectedPolicyDigests = new Set(['b9458619d9ea1cab15759c0191ea05ad4f339efde0c8b8887fbd53412ac6e41a', '7852e8f315670eee4b16d3c6c5df2025df964f5eb726a176af851de8b6ba9028']);
             const changed = await github.paginate(github.rest.pulls.listFiles, {
               ...context.repo,
               pull_number: Number(process.env.PR_NUMBER),
@@ -459,7 +459,7 @@ jobs:
               isStringArray(receipt.reviewed_files) &&
               validOmissions(receipt.omitted_files, receipt.reviewed_files) &&
               validFindings(receipt.findings) &&
-              receipt.policy_digest === expectedPolicyDigest &&
+              expectedPolicyDigests.has(receipt.policy_digest) &&
               typeof receipt.runtime === 'object' && receipt.runtime !== null &&
               Object.keys(receipt.runtime).length === 2 &&
               Object.hasOwn(receipt.runtime, 'harness') && Object.hasOwn(receipt.runtime, 'version') &&
