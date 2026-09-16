@@ -48,7 +48,7 @@ jobs:
       uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
       env:
         PR_NUMBER: ${{ github.event.pull_request.number || github.event.client_payload.pr_number || github.event.inputs.pr_number }}
-        REVIEW_WORKFLOW_REF: 9a6e08d661b3d613505888504774f379da7f5969 # pragma: allowlist secret
+        REVIEW_WORKFLOW_REF: 0cd973c45e019e3ce46f5e56ef2e0b4725445332 # pragma: allowlist secret
       with:
         retries: 0
         script: |
