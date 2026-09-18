@@ -37,8 +37,10 @@ jobs:
         Schneider-Innovations/quickbooks-online-legal=0b116d39ad109ab746fd60ce2c8118ff74d299f7
         Schneider-Innovations/amazon-store-outpost-legal=87f3727d62af63e2fb43dc543892ddab903a93c1
         Schneider-Innovations/amazon-store-outpost-legal=de3fa67bd3bb0d8bea343c08f0bfefec42e60242
+        Schneider-Innovations/amazon-store-outpost-legal=7060f82d9117599ca851415122ee0fdff4f53a26
         Schneider-Innovations/quickbooks-online-legal=87f3727d62af63e2fb43dc543892ddab903a93c1
         Schneider-Innovations/quickbooks-online-legal=de3fa67bd3bb0d8bea343c08f0bfefec42e60242
+        Schneider-Innovations/quickbooks-online-legal=7060f82d9117599ca851415122ee0fdff4f53a26
       APPROVED_REUSABLE_REFS: |
         0a32c354464b4289ad7c791434ac0ded5dfa00f5
         3aed02cdf707b465184382eb301abe542b0e36ff
@@ -148,7 +150,7 @@ jobs:
                   "found #{local_jobs.length}") unless local_jobs.length == 1
             local_job = local_jobs.first
             expected_local_condition = <<~'CONDITION'.split.join(" ")
-              (github.event_name == 'pull_request_target' &&
+              needs.admit-review-request.outputs.admitted == 'true' && ((github.event_name == 'pull_request_target' &&
                github.event.pull_request.base.ref == 'main' &&
                github.event.pull_request.head.repo.full_name == github.repository &&
                github.event.pull_request.draft == false &&
@@ -158,7 +160,7 @@ jobs:
               (github.event_name == 'workflow_dispatch' &&
                github.ref == 'refs/heads/main' &&
                inputs.pr_number > 0 &&
-               github.actor == (vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231'))
+               github.actor == (vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231')))
             CONDITION
             actual_local_condition = local_job["if"]
             unless actual_local_condition.is_a?(String) &&
