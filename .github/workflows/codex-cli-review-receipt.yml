@@ -399,7 +399,7 @@ jobs:
             // untrusted receipt has a SHA-shaped value.  Changing the agent
             // prompt or result contract must therefore be accompanied by a
             // reviewed control-plane change.
-            const allowedPolicyDigests = new Set(['b9458619d9ea1cab15759c0191ea05ad4f339efde0c8b8887fbd53412ac6e41a', '7852e8f315670eee4b16d3c6c5df2025df964f5eb726a176af851de8b6ba9028', 'fedf411a31c0342f727f3e7078393a4b801cd66db4d95aab4e14144542e97da7', '5373e765e5d0ab2a1b836df655f510a63667bf689f4a1afd33a18285760d50b8', 'ddcca120bebb9cc924cacaf15fc3fe244abf13e6198fca23672221a94606965d', 'e4450bcd97186738cb4abff9e8b15d4354eba0794bfbf9f237cf5e484adf7eb5', '3942c33bdd835fca398cb479eda5321ab02dcdc1b61a4043dd89e0be30753608', '00a125027a77125bc121e1de07a0070394637a23b24eb489d3da8af24caca500', '3a38508a5f8f9eb84e64cfbf830154dc41cb361c3bb935899add5d5cfe130e4c']);
+            const allowedPolicyDigests = new Set(['b9458619d9ea1cab15759c0191ea05ad4f339efde0c8b8887fbd53412ac6e41a', '7852e8f315670eee4b16d3c6c5df2025df964f5eb726a176af851de8b6ba9028', 'fedf411a31c0342f727f3e7078393a4b801cd66db4d95aab4e14144542e97da7', '5373e765e5d0ab2a1b836df655f510a63667bf689f4a1afd33a18285760d50b8', 'ddcca120bebb9cc924cacaf15fc3fe244abf13e6198fca23672221a94606965d', 'e4450bcd97186738cb4abff9e8b15d4354eba0794bfbf9f237cf5e484adf7eb5', '3942c33bdd835fca398cb479eda5321ab02dcdc1b61a4043dd89e0be30753608', '00a125027a77125bc121e1de07a0070394637a23b24eb489d3da8af24caca500', '3a38508a5f8f9eb84e64cfbf830154dc41cb361c3bb935899add5d5cfe130e4c', '8b09c15ad2a4f505872536c93defe24c6c3f005f7bac47bdf342d7908e62393e']);
             const changed = await github.paginate(github.rest.pulls.listFiles, {
               ...context.repo,
               pull_number: Number(process.env.PR_NUMBER),
