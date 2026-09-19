@@ -1516,7 +1516,7 @@ jobs:
     if: always()
     # Keep this base-owned API-only cleanup independent of review compute.
     # Require the trusted control-plane pool without a hosted fallback.
-    runs-on: [self-hosted, Linux, X64, ci-control-plane, trusted-api-only]
+    runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
       - name: End matching non-gating request contract
