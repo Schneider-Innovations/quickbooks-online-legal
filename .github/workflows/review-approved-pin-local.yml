@@ -41,6 +41,8 @@ jobs:
         Schneider-Innovations/quickbooks-online-legal=87f3727d62af63e2fb43dc543892ddab903a93c1
         Schneider-Innovations/quickbooks-online-legal=de3fa67bd3bb0d8bea343c08f0bfefec42e60242
         Schneider-Innovations/quickbooks-online-legal=7060f82d9117599ca851415122ee0fdff4f53a26
+        Schneider-Innovations/amazon-store-outpost-legal=cb9fbfe11578df5193bee29ae4efa8091c8f7966
+        Schneider-Innovations/quickbooks-online-legal=cb9fbfe11578df5193bee29ae4efa8091c8f7966
       APPROVED_REUSABLE_REFS: |
         0a32c354464b4289ad7c791434ac0ded5dfa00f5
         3aed02cdf707b465184382eb301abe542b0e36ff
