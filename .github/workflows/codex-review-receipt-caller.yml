@@ -309,6 +309,6 @@ jobs:
       # Keep the reusable workflow's requester check exactly aligned with the
       # caller's protected-base authorization check. The value is a repository
       # variable, not a credential, and is passed only as an immutable input.
-      requester_login: ${{ vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231' }}
+      automation_login: ${{ vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231' }}
     secrets:
       codex_trigger_token: ${{ secrets.CODEX_REVIEW_TRIGGER_TOKEN }}
