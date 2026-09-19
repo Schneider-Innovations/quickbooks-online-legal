@@ -18,14 +18,20 @@ on:
         required: false
         type: string
         default: ready-for-final-review
-      requester_login:
-        description: Exact GitHub login allowed to request final-head review.
+      automation_login:
+        description: GitHub login reserved for protected-main reconciliation automation.
         required: false
         type: string
-        default: mercury1231
+      request_generation:
+        description: Exact scheduling generation published by the guarded caller.
+        required: false
+        type: string
+        default: ''
+    # Every protected caller has one canonical, guarded secret mapping. Keep
+    # the interface declaration so GitHub can validate the reusable call, but
+    # never reference this secret in a job, environment, or bridge command.
     secrets:
       codex_trigger_token:
-        description: Optional requester-owned token used only for guarded Connector escalation comments.
         required: false
 
 # This workflow is only called by the base-owned pull_request_target caller in
@@ -48,11 +54,15 @@ jobs:
       base_sha: ${{ steps.context.outputs.base_sha }}
       head_sha: ${{ steps.context.outputs.head_sha }}
       merge_sha: ${{ steps.context.outputs.merge_sha }}
+      merge_tree_sha: ${{ steps.context.outputs.merge_tree_sha }}
+      merge_ref_attempts: ${{ steps.context.outputs.merge_ref_attempts }}
+      merge_ref_wait_ms: ${{ steps.context.outputs.merge_ref_wait_ms }}
       merge_base_sha: ${{ steps.input.outputs.merge_base_sha }}
+      cancel_subject_digest: ${{ steps.input.outputs.cancel_subject_digest }}
+      cancel_attempt_number: ${{ steps.input.outputs.cancel_attempt_number }}
       pr_number: ${{ steps.context.outputs.pr_number }}
       request_id: ${{ steps.context.outputs.request_id }}
       head_check_run_id: ${{ steps.receipt.outputs.head_check_run_id }}
-      merge_check_run_id: ${{ steps.receipt.outputs.merge_check_run_id }}
     steps:
       - id: context
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
@@ -60,27 +70,59 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           BASE_BRANCH: ${{ inputs.base_branch }}
           REQUIRED_LABEL: ${{ inputs.required_label }}
-          REQUESTER_LOGIN: ${{ inputs.requester_login }}
+          AUTOMATION_LOGIN: ${{ inputs.automation_login }}
+          REVIEW_RUN_ATTEMPT: ${{ github.run_attempt }}
         with:
           script: |
             const requestedPrNumber = Number(process.env.PR_NUMBER);
             const requiredLabel = process.env.REQUIRED_LABEL;
-            const requesterLogin = process.env.REQUESTER_LOGIN;
-            const normalizedRequesterLogin = (requesterLogin || '').toLowerCase();
-            const pr = context.payload.pull_request || (
-              requestedPrNumber > 0
-                ? (await github.rest.pulls.get({ ...context.repo, pull_number: requestedPrNumber })).data
-                : null
-            );
-            if (!pr) {
+            const automationLogin = (process.env.AUTOMATION_LOGIN || '').toLowerCase();
+            const actor = (context.actor || '').toLowerCase();
+            const { owner, repo } = context.repo;
+            const pullNumber = requestedPrNumber || context.payload.pull_request?.number;
+            if (!Number.isInteger(pullNumber) || pullNumber <= 0) {
               core.setFailed('AI_CLI_REVIEW_PR_CONTEXT_REQUIRED');
               return;
             }
-            if (!requiredLabel || !requesterLogin || (context.actor || '').toLowerCase() !== normalizedRequesterLogin) {
+            // pull_request_target carries an event snapshot. Always establish
+            // the review identity from GitHub's current PR before reading its
+            // synthetic merge ref, and repeat that check on every retry below.
+            const pr = (await github.rest.pulls.get({ owner, repo, pull_number: pullNumber })).data;
+            if (!requiredLabel || !actor || (requestedPrNumber > 0 && !automationLogin)) {
               core.setFailed('AI_CLI_REVIEW_REQUESTER_FORBIDDEN');
               return;
             }
-            const { owner, repo } = context.repo;
+            let requesterPermission;
+            try {
+              requesterPermission = (await github.rest.repos.getCollaboratorPermissionLevel({
+                ...context.repo,
+                username: actor,
+              })).data;
+            } catch (error) {
+              core.setFailed(`AI_CLI_REVIEW_REQUESTER_PERMISSION_UNAVAILABLE:${error.status || 'unknown'}`);
+              return;
+            }
+            const allowedRequesterRoles = new Set(['triage', 'write', 'maintain', 'admin']);
+            const detailedPermissions = requesterPermission.user?.permissions || {};
+            const hasAllowedRequesterPermission =
+              ['triage', 'push', 'maintain', 'admin'].some(
+                (permission) => detailedPermissions[permission] === true,
+              ) ||
+              allowedRequesterRoles.has(requesterPermission.role_name) ||
+              ['write', 'admin'].includes(requesterPermission.permission);
+            const isLabelRequest =
+              requestedPrNumber === 0 &&
+              context.payload.action === 'labeled' &&
+              context.payload.label?.name === requiredLabel;
+            const isReconciliationRequest =
+              requestedPrNumber > 0 && actor === automationLogin;
+            if (
+              !hasAllowedRequesterPermission ||
+              !(isLabelRequest || isReconciliationRequest)
+            ) {
+              core.setFailed('AI_CLI_REVIEW_REQUESTER_FORBIDDEN');
+              return;
+            }
             if (
               pr.state !== 'open' ||
               pr.draft === true ||
@@ -101,43 +143,126 @@ jobs:
               return;
             }
             const headSha = pr.head.sha.toLowerCase();
-            const baseSha = pr.base.sha.toLowerCase();
+            let baseSha;
             // A strict required-check rule evaluates GitHub's synthetic PR
             // merge commit, not merely the candidate head. Bind the second
             // Check run to that immutable merge preview only after proving it
             // has the exact base/head parents we are about to review. If the
             // base or head advances later, GitHub creates a new merge preview
             // without this receipt and blocks the merge until a new review.
+            // GitHub rebuilds refs/pull/<n>/merge asynchronously after the
+            // protected base advances. Busy repositories regularly need more
+            // than the former 15-second window, even though the ref converges
+            // to the correct exact base/head pair shortly afterwards. Keep the
+            // validation fail-closed, but allow a bounded 90-second window for
+            // that control-plane convergence.
+            const mergeRefBackoffMilliseconds = [2_000, 4_000, 8_000, 16_000, 30_000, 30_000];
+            const mergeRefMaxAttempts = mergeRefBackoffMilliseconds.length + 1;
+            const safeMergeRefFailure = (error) => {
+              const status = Number.isInteger(error?.status) ? String(error.status) : 'unknown';
+              const code = typeof error?.code === 'string' && /^[A-Z0-9_]{1,80}$/.test(error.code)
+                ? error.code
+                : 'unknown';
+              return `status=${status}:code=${code}`;
+            };
+            const mergeRefStartedAt = Date.now();
             let mergeSha;
-            try {
-              const mergeRef = await github.rest.git.getRef({
-                owner,
-                repo,
-                ref: `pull/${pr.number}/merge`,
-              });
-              mergeSha = mergeRef.data.object?.sha?.toLowerCase();
-              const mergeCommit = await github.rest.repos.getCommit({
-                owner,
-                repo,
-                ref: mergeSha,
-              });
-              const parents = new Set((mergeCommit.data.parents || []).map((parent) => parent.sha.toLowerCase()));
-              if (
-                !/^[0-9a-f]{40}$/.test(mergeSha || '') ||
-                parents.size !== 2 ||
-                !parents.has(baseSha) ||
-                !parents.has(headSha)
-              ) {
-                throw new Error('AI_CLI_REVIEW_MERGE_REF_INVALID');
+            let mergeRefAttempts = 0;
+            let lastMergeRefFailure = 'unknown';
+            for (let attempt = 1; attempt <= mergeRefMaxAttempts; attempt += 1) {
+              mergeRefAttempts = attempt;
+              try {
+                const livePr = (await github.rest.pulls.get({ owner, repo, pull_number: pr.number })).data;
+                // PR base.sha is an asynchronously refreshed PR snapshot.
+                // Resolve the protected branch itself for the review tuple.
+                const baseRef = await github.rest.git.getRef({
+                  owner, repo, ref: `heads/${process.env.BASE_BRANCH}`,
+                });
+                const liveBaseSha = baseRef.data.object?.sha?.toLowerCase();
+                const liveHeadSha = livePr.head?.sha?.toLowerCase();
+                if (
+                  livePr.state !== 'open' ||
+                  livePr.draft === true ||
+                  livePr.base?.ref !== process.env.BASE_BRANCH ||
+                  livePr.head?.repo?.full_name !== `${owner}/${repo}` ||
+                  !/^[0-9a-f]{40}$/.test(liveBaseSha || '') ||
+                  liveHeadSha !== headSha ||
+                  !(livePr.labels || []).some((label) => label.name === requiredLabel)
+                ) {
+                  core.setFailed(`AI_CLI_REVIEW_MERGE_REF_CONTEXT_CHANGED:attempt=${attempt}`);
+                  return;
+                }
+                const mergeRef = await github.rest.git.getRef({
+                  owner,
+                  repo,
+                  ref: `pull/${pr.number}/merge`,
+                });
+                const candidateMergeSha = mergeRef.data.object?.sha?.toLowerCase();
+                if (!/^[0-9a-f]{40}$/.test(candidateMergeSha || '')) {
+                  const error = new Error('synthetic merge ref did not resolve to a full SHA');
+                  error.code = 'MERGE_REF_SHA_INVALID';
+                  throw error;
+                }
+                const mergeCommit = await github.rest.repos.getCommit({
+                  owner,
+                  repo,
+                  ref: candidateMergeSha,
+                });
+                const parents = (mergeCommit.data.parents || []).map((parent) => parent.sha?.toLowerCase());
+                const mergeTreeSha = mergeCommit.data.commit?.tree?.sha?.toLowerCase();
+                if (parents.length !== 2 || parents[0] !== liveBaseSha || parents[1] !== headSha) {
+                  const error = new Error('synthetic merge ref parents did not match the live PR');
+                  error.code = 'MERGE_REF_PARENTS_INVALID';
+                  throw error;
+                }
+                if (!/^[0-9a-f]{40}$/.test(mergeTreeSha || '')) {
+                  const error = new Error('synthetic merge tree did not resolve to a full SHA');
+                  error.code = 'MERGE_TREE_SHA_INVALID';
+                  throw error;
+                }
+                const baseReadback = await github.rest.git.getRef({
+                  owner, repo, ref: `heads/${process.env.BASE_BRANCH}`,
+                });
+                if (baseReadback.data.object?.sha?.toLowerCase() !== liveBaseSha) {
+                  const error = new Error('protected base advanced during merge preview validation');
+                  error.code = 'MERGE_REF_BASE_CHANGED';
+                  throw error;
+                }
+                baseSha = liveBaseSha;
+                mergeSha = candidateMergeSha;
+                core.setOutput('merge_tree_sha', mergeTreeSha);
+                break;
+              } catch (error) {
+                lastMergeRefFailure = safeMergeRefFailure(error);
+                if (error?.status === 403 || error?.status === 429) {
+                  core.setFailed(`AI_CLI_REVIEW_MERGE_REF_API_UNAVAILABLE:${lastMergeRefFailure}`);
+                  return;
+                }
+                const waitingMilliseconds = attempt < mergeRefMaxAttempts
+                  ? mergeRefBackoffMilliseconds[attempt - 1]
+                  : 0;
+                core.notice(`AI_CLI_REVIEW_MERGE_REF_WAIT:attempt=${attempt}/${mergeRefMaxAttempts}:wait_ms=${waitingMilliseconds}:${lastMergeRefFailure}`);
+                if (waitingMilliseconds > 0) {
+                  await new Promise((resolve) => setTimeout(resolve, waitingMilliseconds));
+                }
               }
-            } catch {
-              core.setFailed('AI_CLI_REVIEW_MERGE_REF_UNAVAILABLE');
+            }
+            const mergeRefWaitMilliseconds = Date.now() - mergeRefStartedAt;
+            if (!mergeSha) {
+              core.setFailed(`AI_CLI_REVIEW_MERGE_REF_UNAVAILABLE:attempts=${mergeRefAttempts}:wait_ms=${mergeRefWaitMilliseconds}:${lastMergeRefFailure}`);
               return;
             }
-            const requestId = `cli-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT || '1'}-${pr.number}-${headSha.slice(0, 12)}`;
+            const runAttempt = process.env.REVIEW_RUN_ATTEMPT;
+            if (!/^[1-9][0-9]*$/.test(runAttempt || '')) {
+              core.setFailed('AI_CLI_REVIEW_RUN_ATTEMPT_INVALID');
+              return;
+            }
+            const requestId = `cli-${context.runId}-${runAttempt}-${pr.number}-${headSha.slice(0, 12)}`;
             core.setOutput('head_sha', headSha);
             core.setOutput('base_sha', baseSha);
             core.setOutput('merge_sha', mergeSha);
+            core.setOutput('merge_ref_attempts', String(mergeRefAttempts));
+            core.setOutput('merge_ref_wait_ms', String(mergeRefWaitMilliseconds));
             core.setOutput('pr_number', String(pr.number));
             core.setOutput('request_id', requestId);
 
@@ -163,6 +288,7 @@ jobs:
           PR_NUMBER: ${{ steps.context.outputs.pr_number }}
           REQUEST_ID: ${{ steps.context.outputs.request_id }}
           REPOSITORY: ${{ github.repository }}
+          REVIEW_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
           umask 027
@@ -217,10 +343,16 @@ jobs:
           # interpolation and binds the review contract to the exact diff.
           node - "$temporary/changed-files.z" "$temporary/request.json" <<'NODE'
           const fs = require('fs');
+          const crypto = require('crypto');
           const [changedFilesPath, requestPath] = process.argv.slice(2);
           const changedFiles = fs.readFileSync(changedFilesPath).toString('utf8').split('\0').filter(Boolean);
           if (new Set(changedFiles).size !== changedFiles.length) {
             throw new Error('AI_CLI_REVIEW_CHANGED_FILES_INVALID');
+          }
+          const cancelSubjectDigest = crypto.randomBytes(32).toString('hex');
+          const cancelAttemptNumber = Number(process.env.REVIEW_RUN_ATTEMPT);
+          if (!Number.isSafeInteger(cancelAttemptNumber) || cancelAttemptNumber < 1) {
+            throw new Error('AI_CLI_REVIEW_CANCEL_ATTEMPT_INVALID');
           }
           const request = {
             request_id: process.env.REQUEST_ID,
@@ -231,8 +363,16 @@ jobs:
             merge_base_sha: process.env.MERGE_BASE_SHA,
             merge_sha: process.env.MERGE_SHA,
             changed_files: changedFiles,
+            cancel_binding: {
+              schema: 'code-review-cancel-binding/v1',
+              subject_digest: cancelSubjectDigest,
+              lease_generation: 1,
+              attempt_number: cancelAttemptNumber,
+            },
           };
           fs.writeFileSync(requestPath, `${JSON.stringify(request)}\n`, { mode: 0o640 });
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `cancel_subject_digest=${cancelSubjectDigest}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `cancel_attempt_number=${cancelAttemptNumber}\n`);
           NODE
           rm -f -- "$temporary/changed-files.z"
           chmod 0640 "$temporary/diff.patch" "$temporary/source.tar.gz" "$temporary/request.json"
@@ -247,10 +387,16 @@ jobs:
           PR_NUMBER: ${{ steps.context.outputs.pr_number }}
           REQUEST_ID: ${{ steps.context.outputs.request_id }}
         with:
+          # Do not enable github-script request-level retries here. GitHub does
+          # not make checks.create idempotent by external_id, so an ambiguous
+          # create response could produce duplicate Check runs before this
+          # script has another chance to re-query the fixed identity. A
+          # transport error therefore fails closed; a new protected-main
+          # dispatch re-runs the lookup before it can create anything.
           script: |
             const output = {
               title: 'Codex CLI review pending',
-              summary: `Shadow CLI review requested for ${process.env.HEAD_SHA}; strict merge gate targets ${process.env.MERGE_SHA}.`,
+              summary: `Shadow CLI review requested for ${process.env.HEAD_SHA}; receipt binds reviewed merge ${process.env.MERGE_SHA}.`,
               text: JSON.stringify({
                 schema_version: '1.0',
                 mode: 'shadow',
@@ -260,85 +406,125 @@ jobs:
                 status: 'pending',
               }, null, 2),
             };
-            const invalidationPrefix = `ai-review-invalidated:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:`;
+            const headExternalId = `ai-cli-review:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}`;
             const existingChecks = await github.paginate(
               github.rest.checks.listForRef,
-              { ...context.repo, ref: process.env.HEAD_SHA, per_page: 100 },
+              { ...context.repo, ref: process.env.HEAD_SHA, per_page: 100, filter: 'all' },
             );
-            const invalidation = existingChecks.find((check) =>
-              check.name === 'ai-review/receipt' &&
+            const newestActiveGeneration = (checks, prefixes) => checks
+              .filter((check) =>
+                check.name === 'ai-review/receipt' &&
                 check.status !== 'completed' &&
-                check.external_id?.startsWith(invalidationPrefix),
-            );
-            const headCheck = invalidation
+                prefixes.some((prefix) => check.external_id?.startsWith(prefix)),
+              )
+              .sort((left, right) => Number(right.id || 0) - Number(left.id || 0))[0] || null;
+            const invalidationPrefix = `ai-review-invalidated:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:`;
+            // Completed Check runs cannot return to an active state.  A
+            // terminal invalidation remains fail-closed audit evidence; a
+            // newly authorized exact-head review creates a distinct receipt
+            // generation, exactly like an ordinary GitHub check re-run.
+            // Only a non-terminal generation may be resumed after an
+            // interrupted protected-main workflow.
+            const activeInvalidation = newestActiveGeneration(existingChecks, [invalidationPrefix]);
+            const existingHead = newestActiveGeneration(existingChecks, [headExternalId]);
+            const reusableHead = activeInvalidation || existingHead;
+            const generationStartedAt = Date.now();
+            const headGenerationExternalId = `${headExternalId}:run:${context.runId}:${generationStartedAt}`;
+            const headCheck = reusableHead
               ? await github.rest.checks.update({
                   ...context.repo,
-                  check_run_id: invalidation.id,
-                  status: 'in_progress',
-                  output,
+                   check_run_id: reusableHead.id,
+                   status: 'in_progress',
+                   external_id: headGenerationExternalId,
+                   output,
                 })
               : await github.rest.checks.create({
                   ...context.repo,
                   name: 'ai-review/receipt',
                   head_sha: process.env.HEAD_SHA,
                   status: 'in_progress',
-                  external_id: `ai-cli-review:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}`,
+                  external_id: headGenerationExternalId,
                   output,
                 });
-            let mergeCheck;
-            try {
-              const mergeInvalidationPrefix = `ai-review-invalidated:merge:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:${process.env.MERGE_SHA}:`;
-              const existingMergeChecks = await github.paginate(
-                github.rest.checks.listForRef,
-                { ...context.repo, ref: process.env.MERGE_SHA, per_page: 100 },
-              );
-              const mergeInvalidation = existingMergeChecks.find((check) =>
-                check.name === 'ai-review/receipt' &&
-                  check.status !== 'completed' &&
-                  check.external_id?.startsWith(mergeInvalidationPrefix),
-              );
-              mergeCheck = mergeInvalidation
-                ? await github.rest.checks.update({
-                    ...context.repo,
-                    check_run_id: mergeInvalidation.id,
-                    status: 'in_progress',
-                    output,
-                  })
-                : await github.rest.checks.create({
-                    ...context.repo,
-                    name: 'ai-review/receipt',
-                    head_sha: process.env.MERGE_SHA,
-                    status: 'in_progress',
-                    external_id: `ai-cli-review:merge:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}:${process.env.MERGE_SHA}`,
-                    output,
-                  });
-            } catch {
-              await github.rest.checks.update({
-                ...context.repo,
-                check_run_id: headCheck.data.id,
-                status: 'completed',
-                conclusion: 'failure',
-                completed_at: new Date().toISOString(),
-                output: {
-                  title: 'Codex CLI strict merge receipt unavailable',
-                  summary: 'Fail-closed Shadow result: merge_receipt_create_failed.',
-                },
-              });
-              core.setFailed('AI_CLI_REVIEW_MERGE_RECEIPT_CREATE_FAILED');
-              return;
-            }
             core.setOutput('head_check_run_id', String(headCheck.data.id));
-            core.setOutput('merge_check_run_id', String(mergeCheck.data.id));
 
       - name: Remove submitted snapshot after failed preparation
         if: (failure() || cancelled()) && steps.context.outputs.request_id != ''
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
           REQUEST_ID: ${{ steps.context.outputs.request_id }}
+          CANCEL_SUBJECT_DIGEST: ${{ steps.input.outputs.cancel_subject_digest }}
+          CANCEL_ATTEMPT_NUMBER: ${{ steps.input.outputs.cancel_attempt_number }}
         with:
           script: |
             const fs = require('fs');
             const path = require('path');
+            // Submission can precede preparation failure or cancellation. The
+            // verifier job may never start, so terminalize here as well before
+            // removing input; a claimed producer can still publish afterwards.
+            const requestId = process.env.REQUEST_ID || '';
+            if (!/^cli-[0-9]+-[0-9]+-[0-9]+-[0-9a-f]+$/.test(requestId)) {
+              core.setFailed('AI_CLI_REVIEW_TERMINAL_REQUEST_INVALID');
+              return;
+            }
+            const digest = process.env.CANCEL_SUBJECT_DIGEST || '';
+            const attempt = Number(process.env.CANCEL_ATTEMPT_NUMBER);
+            if (!/^[0-9a-f]{64}$/.test(digest) || !Number.isSafeInteger(attempt) || attempt < 1) {
+              core.setFailed('AI_CLI_REVIEW_CANCEL_BINDING_INVALID');
+              return;
+            }
+            const cancelIncoming = '/var/lib/codex-review-bridge/cancel-incoming';
+            const cancelAcks = '/var/lib/codex-review-bridge/cancel-acks';
+            const sequence = 1;
+            const command = {
+              schema_version: '2.0', request_id: requestId, cancel_sequence: sequence,
+              reason: 'expired', created_at: new Date().toISOString(),
+              subject_digest: digest, lease_generation: 1, attempt_number: attempt,
+            };
+            const cancelTarget = path.join(cancelIncoming, `${requestId}.${sequence}.json`);
+            const cancelTemporary = path.join(cancelIncoming, `.${requestId}.${sequence}.${process.pid}.tmp`);
+            fs.writeFileSync(cancelTemporary, `${JSON.stringify(command)}\n`, { flag: 'wx', mode: 0o600 });
+            const temporaryFd = fs.openSync(cancelTemporary, 'r');
+            try { fs.fsyncSync(temporaryFd); } finally { fs.closeSync(temporaryFd); }
+            try { fs.linkSync(cancelTemporary, cancelTarget); } catch (error) {
+              if (error.code !== 'EEXIST') throw error;
+            } finally {
+              fs.rmSync(cancelTemporary);
+            }
+            const cancelDirectoryFd = fs.openSync(cancelIncoming, 'r');
+            try { fs.fsyncSync(cancelDirectoryFd); } finally { fs.closeSync(cancelDirectoryFd); }
+            const ackPath = path.join(cancelAcks, `${requestId}.${sequence}.json`);
+            const cancelDeadline = Date.now() + 60 * 1000;
+            let resolution = null;
+            while (Date.now() < cancelDeadline) {
+              if (fs.existsSync(ackPath)) {
+                resolution = JSON.parse(fs.readFileSync(ackPath, 'utf8'));
+                break;
+              }
+              await new Promise((resolve) => setTimeout(resolve, 1000));
+            }
+            if (!resolution || resolution.request_id !== requestId ||
+                resolution.cancel_sequence !== sequence ||
+                !['ACCEPTED', 'OBSOLETE_AFTER_TERMINAL'].includes(resolution.state)) {
+              core.setFailed('AI_CLI_REVIEW_CANCEL_NOT_ACCEPTED');
+              return;
+            }
+            core.info(`AI_CLI_REVIEW_CANCEL_${resolution.state}`);
+            const ready = '/var/lib/codex-review-bridge/outgoing/ready';
+            const marker = path.join(ready, `${requestId}.terminal`);
+            try {
+              const fd = fs.openSync(marker, 'wx', 0o600);
+              try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+            } catch (error) {
+              if (error.code !== 'EEXIST') throw error;
+              const metadata = fs.lstatSync(marker);
+              if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size !== 0 ||
+                  metadata.uid !== process.getuid() || (metadata.mode & 0o777) !== 0o600) {
+                throw new Error('AI_CLI_REVIEW_TERMINAL_MARKER_INVALID');
+              }
+            }
+            const directoryFd = fs.openSync(ready, 'r');
+            try { fs.fsyncSync(directoryFd); } finally { fs.closeSync(directoryFd); }
             const root = path.resolve('/var/lib/codex-review-bridge/incoming');
             const target = path.resolve(root, process.env.REQUEST_ID);
             if (!target.startsWith(`${root}${path.sep}`)) {
@@ -350,76 +536,261 @@ jobs:
   await-cli-review:
     name: Verify isolated CLI review
     needs: prepare-cli-review
+    outputs:
+      receipt_step_outcome: ${{ steps.receipt.outcome }}
+      receipt_protocol: ${{ steps.receipt.outputs.receipt_protocol }}
+      producer_receipt_observed: ${{ steps.receipt.outputs.producer_receipt_observed }}
+      consumer_terminalized: ${{ steps.terminalize.outputs.consumer_terminalized }}
     runs-on:
       group: code-review
       labels: [self-hosted, code-review, cli-review, shadow-only]
-    timeout-minutes: 28
+    # Covers the bounded 30-minute claim wait, 12-minute processing budget,
+    # and workflow overhead without allowing an unbounded runner occupation.
+    timeout-minutes: 45
     steps:
       - id: receipt
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
           HEAD_CHECK_RUN_ID: ${{ needs.prepare-cli-review.outputs.head_check_run_id }}
-          MERGE_CHECK_RUN_ID: ${{ needs.prepare-cli-review.outputs.merge_check_run_id }}
           HEAD_SHA: ${{ needs.prepare-cli-review.outputs.head_sha }}
           MERGE_SHA: ${{ needs.prepare-cli-review.outputs.merge_sha }}
+          MERGE_TREE_SHA: ${{ needs.prepare-cli-review.outputs.merge_tree_sha }}
           BASE_SHA: ${{ needs.prepare-cli-review.outputs.base_sha }}
           MERGE_BASE_SHA: ${{ needs.prepare-cli-review.outputs.merge_base_sha }}
+          MERGE_REF_ATTEMPTS: ${{ needs.prepare-cli-review.outputs.merge_ref_attempts }}
+          MERGE_REF_WAIT_MS: ${{ needs.prepare-cli-review.outputs.merge_ref_wait_ms }}
           PR_NUMBER: ${{ needs.prepare-cli-review.outputs.pr_number }}
           REQUEST_ID: ${{ needs.prepare-cli-review.outputs.request_id }}
+          REQUEST_GENERATION: ${{ inputs.request_generation }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+          REVIEW_RUN_ATTEMPT: ${{ github.run_attempt }}
         with:
           script: |
             const fs = require('fs');
             const path = require('path');
             const requestId = process.env.REQUEST_ID;
-            const resultRoot = path.resolve('/var/lib/codex-review-bridge/outgoing');
-            const resultPath = path.resolve(resultRoot, `${requestId}.json`);
-            if (!resultPath.startsWith(`${resultRoot}${path.sep}`)) {
+            const reviewRunAttempt = Number(process.env.REVIEW_RUN_ATTEMPT);
+            if (!Number.isSafeInteger(reviewRunAttempt) || reviewRunAttempt < 1) {
+              core.setFailed('AI_CLI_REVIEW_RUN_ATTEMPT_INVALID');
+              return;
+            }
+            const readyRoot = path.resolve('/var/lib/codex-review-bridge/outgoing/ready');
+            const legacyRoot = path.resolve('/var/lib/codex-review-bridge/outgoing');
+            const incomingRoot = path.resolve('/var/lib/codex-review-bridge/incoming');
+            const readyPath = path.resolve(readyRoot, `${requestId}.json`);
+            const legacyPath = path.resolve(legacyRoot, `${requestId}.json`);
+            const inputPath = path.resolve(incomingRoot, requestId);
+            if (!readyPath.startsWith(`${readyRoot}${path.sep}`) ||
+                !legacyPath.startsWith(`${legacyRoot}${path.sep}`) ||
+                !inputPath.startsWith(`${incomingRoot}${path.sep}`)) {
               core.setFailed('AI_CLI_REVIEW_RESULT_PATH_INVALID');
               return;
             }
-            const deadline = Date.now() + 660 * 1000;
+            // Queueing and model execution are separate bounded phases. The
+            // old single 660-second deadline started before the Agent claimed
+            // the request, so a healthy request that waited behind another
+            // model invocation could be terminalized while its own model was
+            // still running. The Agent atomically moves a request out of the
+            // submitter-visible incoming directory when work starts; observe
+            // only that path transition and never read the claimed snapshot.
+            const queueDeadline = Date.now() + 30 * 60 * 1000;
+            const processingBudgetMs = 12 * 60 * 1000;
+            let processingDeadline = null;
             let receipt = null;
-            while (Date.now() < deadline) {
-              if (fs.existsSync(resultPath)) {
+            let resultPath = null;
+            while (true) {
+              resultPath = [readyPath, legacyPath].find((candidate) => fs.existsSync(candidate)) || null;
+              if (resultPath) {
+                core.setOutput('producer_receipt_observed', 'true');
                 const bytes = fs.readFileSync(resultPath);
                 if (bytes.length <= 64 * 1024) {
                   try { receipt = JSON.parse(bytes.toString('utf8')); } catch { receipt = null; }
                 }
                 break;
               }
-              await new Promise((resolve) => setTimeout(resolve, 10 * 1000));
+              const now = Date.now();
+              if (processingDeadline === null && !fs.existsSync(inputPath)) {
+                processingDeadline = now + processingBudgetMs;
+                core.info('AI_CLI_REVIEW_REQUEST_CLAIMED');
+              }
+              const activeDeadline = processingDeadline ?? queueDeadline;
+              if (now >= activeDeadline) break;
+              await new Promise((resolve) => setTimeout(resolve, Math.min(10 * 1000, activeDeadline - now)));
             }
             const expectedHead = process.env.HEAD_SHA;
             const expectedMerge = process.env.MERGE_SHA;
+            const expectedMergeTree = process.env.MERGE_TREE_SHA;
             const expectedBase = process.env.BASE_SHA;
             const expectedMergeBase = process.env.MERGE_BASE_SHA;
+            const mergeRefAttempts = Number(process.env.MERGE_REF_ATTEMPTS);
+            const mergeRefWaitMilliseconds = Number(process.env.MERGE_REF_WAIT_MS);
+            const mergeRefObservation =
+              Number.isInteger(mergeRefAttempts) && mergeRefAttempts >= 1 &&
+              Number.isInteger(mergeRefWaitMilliseconds) && mergeRefWaitMilliseconds >= 0
+                ? ` Merge preview verified after ${mergeRefAttempts} attempt(s) and ${mergeRefWaitMilliseconds}ms bounded wait.`
+                : '';
+            const assertCurrentReviewBinding = async () => {
+              const pr = (await github.rest.pulls.get({
+                ...context.repo, pull_number: Number(process.env.PR_NUMBER),
+              })).data;
+              const base = (await github.rest.git.getRef({
+                ...context.repo, ref: `heads/${process.env.BASE_BRANCH || 'main'}`,
+              })).data.object?.sha?.toLowerCase();
+              const merge = (await github.rest.git.getRef({
+                ...context.repo, ref: `pull/${process.env.PR_NUMBER}/merge`,
+              })).data.object?.sha?.toLowerCase();
+              const mergeCommit = await github.rest.repos.getCommit({ ...context.repo, ref: merge });
+              const parents = (mergeCommit.data.parents || []).map((parent) => parent.sha?.toLowerCase());
+              const tree = mergeCommit.data.commit?.tree?.sha?.toLowerCase();
+              if (pr.state !== 'open' || pr.draft || pr.base.ref !== (process.env.BASE_BRANCH || 'main') ||
+                  pr.head.sha?.toLowerCase() !== expectedHead || base !== expectedBase ||
+                  tree !== expectedMergeTree ||
+                  parents.length !== 2 || parents[0] !== expectedBase || parents[1] !== expectedHead) {
+                throw new Error('AI_CLI_REVIEW_LIVE_BINDING_CHANGED');
+              }
+              return { base, head: expectedHead, merge, tree };
+            };
+            await assertCurrentReviewBinding();
             // This is sha256("review-result-schema/v2\\0" + the approved
             // base-owned Codex prompt).  It is deliberately pinned here, in
             // the workflow trust root, rather than merely checking that an
             // untrusted receipt has a SHA-shaped value.  Changing the agent
             // prompt or result contract must therefore be accompanied by a
             // reviewed control-plane change.
-            const allowedPolicyDigests = new Set(['b9458619d9ea1cab15759c0191ea05ad4f339efde0c8b8887fbd53412ac6e41a', '7852e8f315670eee4b16d3c6c5df2025df964f5eb726a176af851de8b6ba9028', 'fedf411a31c0342f727f3e7078393a4b801cd66db4d95aab4e14144542e97da7', '5373e765e5d0ab2a1b836df655f510a63667bf689f4a1afd33a18285760d50b8', 'ddcca120bebb9cc924cacaf15fc3fe244abf13e6198fca23672221a94606965d', 'e4450bcd97186738cb4abff9e8b15d4354eba0794bfbf9f237cf5e484adf7eb5', '3942c33bdd835fca398cb479eda5321ab02dcdc1b61a4043dd89e0be30753608', '00a125027a77125bc121e1de07a0070394637a23b24eb489d3da8af24caca500', '3a38508a5f8f9eb84e64cfbf830154dc41cb361c3bb935899add5d5cfe130e4c', '8b09c15ad2a4f505872536c93defe24c6c3f005f7bac47bdf342d7908e62393e', '0dad75a1553697b98ebfafd04e44490578d318d751a1c1b5ff681fa16c7fc538', '24d2b2b2f24645b7cea3664ef1766fcddc4c3165336b1acc9c1753098a6bfa0e', 'fc9bcdc778c2d87c28842d84e616c3f9a27ca4cdea355038c397a7837596e7e7', '037e60e0e8eef79cd48941e2659a23f4a4e467164d37bd8b147488cbcb785c57', 'c7967e5e8443f6647a3976cbc187f9ea372e72f0f9fea6496dbfee944a99fcee', '4b2e6283dcdb3feced57cf6f3a4746c7a2ca52d65f50a76a45e2957898e49ba0', '544f65158dab87376a913736b09865e50d333f8d31ba0132483ad470e16317b0', '4642fc67c98c65f09dc6129b635d08be49051538c7c1745d154384e64721629d', 'b9414ed00c2d9c403d4d0366c3212c495459b01163a586d0c7dff99c1282ffb8', '65201630b290f30e3b7088230db35bb791ad793aa3cc6efc7e1bfa2c81bf1a16', '220dc2dd475fead61d5b680f6e0ae877bd122da3c74bbada72b6948624db8dcd', '9b250c681b659ccfa71fbf4a1c9c90181219dd4b3eab0801b680766d44fbfa60', '61849815e1961f6e3c09e4894711452016bdc23ed13dbae843e0a2413272d81b', '3a702e2fa7c8bdc0387d935ab7a7f2cef1e2e5d6dd28af1e9c2e28c7cdabced7']);
+            // Policy digests are immutable cryptographic identities, not
+            // ordered release numbers. During a controlled control-plane
+            // rotation, add the predecessor and successor digests here, then
+            // remove the predecessor in a follow-up change. Never accept an
+            // arbitrary digest merely because it appears to be newer.
+            const allowedPolicyDigests = new Set([
+              '943ed3ffbe420a8418c0e55e869c69bd52d21d234f8359284e73bd8a7fa6ab3a',
+              // Successor generated by platform-infrastructure commit
+              // 593717bc (model-capacity circuit-break policy).
+              '8b757fcbe91ff2bc372d7a2dca86ee79e0bfb849d6f35e649f92eb4faf3545f7',
+              // Successor generated by platform-infrastructure commit
+              // 5f5545f (bounded OpenAPI snapshot context policy).
+              '6f794bbb017da0070a4e711b05499307c279b53024f4063e0a3ad7ca73f1dd30',
+              // Successor generated by platform-infrastructure commit
+              // 60f32f6 (PNG visual-baseline metadata context policy).
+              '4a714345c30da0edf7f7fe642c4d09373c649552615b321a55d1e9fc65156785',
+              // Transitional policy for the responsive bounded batch runtime.
+              '56b8aedc18bd6e3d44cc254a06d4d88b11a55d6af5c4737f64712d50d533a810',
+              // Successor for the bounded 96 KiB cross-batch reconciliation
+              // transport policy in platform-infrastructure.
+              'f80209eaba601fedcf98b9c706e540167a56d82ea4f06e01be0a44bc15b9e777',
+              // Successor for bounded Python whole-file structure context in
+              // platform-infrastructure self-hosting reviews.
+              'e38dea575188cf95e430ba0cad5bcf62e2b50ae73cb777a56931a516561ed70d',
+              // Successor for byte-bounded changed-hunk source context in
+              // Python outlines after platform-infrastructure PR #922.
+              'a426c13c5594581b7b43c597493b9e8ceac443c440d27ba247f429f65402052c',
+              // Successor for bounded comprehensive retry after a clean
+              // INCONCLUSIVE result in platform-infrastructure PR #920.
+              'a1f6ad15287320f3a83aa5d268c8b308e6fbeaa90074ffee18cb959ee294b7b9',
+              // Deterministic review policy from platform-infrastructure
+              // commit fffa46d9b58d4393c2b44d551b2bc53d042fe241.
+              '36d7ad436ff77a3198ab1f7e03f380cf4becbaf7ae501731b27047401441deba',
+              // Successor for complete non-generated large-file context and
+              // its bounded 64 KiB single-batch envelope.
+              '2c7a1f86ac731c985c97d540a26f96b4d686373776e82d9c1f966e1cb2223923',
+              // Successor with bounded JS/TS declarations and changed-symbol
+              // references after exact checkpoint source attestation.
+              '392e4ac8bf0e4fe76bdee70d62d99caa501c6ee5d6a4eedbc06282befb03a340',
+              // Successor that permits tightly matched Codex transport
+              // reconnect progress while terminal model errors still fail closed.
+              'a2eca0035a6f286f22233887f19416723e116c52f3779a2f787a7a8392007709',
+              // Evidence-led severity rubric; medium/low remain non-blocking.
+              'e7b28a46e166df3d1a395bb852bb68ea96061bf6c81c9db4019eea918eccf271',
+              // Same severity rubric with the reviewed 160 KiB exception for
+              // one exact PostgreSQL integration-test path.
+              'b5d29ecbe27ff3b9ad217e1239ce296f7955626ed1c2411842fee43754cde527',
+              // Platform #999 / 19dd16b1: exact canonical SQL full-source bounds.
+              'fd3a16b34b4908c77fd51753e6531aedda516d2eea7ba6395b9c83db5a72d895',
+              // Platform #1017 / f62c5303: bounded PIM schema full-source
+              // coverage with content-free context-limit diagnostics.
+              '159ba30289199ee42cdb9bb8da5fbcf60b10a1b09bdda3f21d486ab95e4c8774',
+              // Platform #1024 candidate: retain the exact snd-os-web
+              // endpoint-catalog diff while omitting its generated post-image.
+              '355c6e41a3ffe43ff5bcb9ffce0e3c7ec081c0d5018fb298eb9a98c1440ab2db',
+              // Platform #1024 combined with the already-landed Python
+              // changed-context policy from platform-infrastructure #1030.
+              '8bf19a30149a3a950d6f2c783ee3e002e2ab29b09cb0c4a3b43012157d8d85fd',
+              // Platform main after #1024 and #1030: combined generated-catalog
+              // omission and expanded Python changed-context policy.
+              '00a5cd8287c97605c114b48891585adc39b33c7a35b62b2b37b0695425d6f731',
+              // Platform #1026 candidate: compact only checkpoint-verified
+              // Playwright PNG binary patches in model-facing context.
+              'f43ba17b7bef201155ce03b8ac89c082a8dfe679da9eae5a36412571a439b26c',
+              // Bound by config/review-policy-attestations/
+              // platform-review-2026-09-15.11.json after Platform #1026.
+              'b9458619d9ea1cab15759c0191ea05ad4f339efde0c8b8887fbd53412ac6e41a',
+              // Platform #1124 candidate: deterministic complete-hunk shards
+              // with bounded source windows and mandatory reconciliation.
+              '8b09c15ad2a4f505872536c93defe24c6c3f005f7bac47bdf342d7908e62393e',
+              // Successor generated by platform-infrastructure commit
+              // 60f32f6 (full visual-baseline review-context policy).
+              'b0923ec22a56c268599ee0a270b9f2baab120008ef0105c6f16870a054b7858a',
+              // Candidate Platform #1049, exact source/artifact bindings in
+              // config/review-policy-attestations/package-script-context-candidate.json.
+              '7852e8f315670eee4b16d3c6c5df2025df964f5eb726a176af851de8b6ba9028',
+              'fedf411a31c0342f727f3e7078393a4b801cd66db4d95aab4e14144542e97da7',
+              '5373e765e5d0ab2a1b836df655f510a63667bf689f4a1afd33a18285760d50b8',
+              'ddcca120bebb9cc924cacaf15fc3fe244abf13e6198fca23672221a94606965d',
+              'e4450bcd97186738cb4abff9e8b15d4354eba0794bfbf9f237cf5e484adf7eb5',
+              '3942c33bdd835fca398cb479eda5321ab02dcdc1b61a4043dd89e0be30753608',
+              '00a125027a77125bc121e1de07a0070394637a23b24eb489d3da8af24caca500',
+              // Platform review-2026-09-17.3 raises full-source bounds only for
+              // snd-agent-workflows/data/schema/platform_workflow_schema.sql.
+              'b4c3e08ebd433651d19305b72b49f548cdeec186de4dd92713e80d1059ce51e1',
+              // Global successor emitted by the attested Agent artifact. Its
+              // only larger source budget applies to a one-file A2E batch;
+              // other review batches retain the default limit.
+              '3a38508a5f8f9eb84e64cfbf830154dc41cb361c3bb935899add5d5cfe130e4c',
+              // Platform #1141 candidate: bounded growth allowance for the
+              // authoritative workflow schema full-source review unit.
+              '0dad75a1553697b98ebfafd04e44490578d318d751a1c1b5ff681fa16c7fc538',
+              // Platform #1147 candidate: the same bounded schema exception
+              // now also admits its 8,565-line authoritative source unit.
+              '24d2b2b2f24645b7cea3664ef1766fcddc4c3165336b1acc9c1753098a6bfa0e',
+              'fc9bcdc778c2d87c28842d84e616c3f9a27ca4cdea355038c397a7837596e7e7',
+              '037e60e0e8eef79cd48941e2659a23f4a4e467164d37bd8b147488cbcb785c57',
+              // Platform #1163 candidate: bounded three-lane execution for
+              // large review batch sets with deterministic reconciliation.
+              'c7967e5e8443f6647a3976cbc187f9ea372e72f0f9fea6496dbfee944a99fcee',
+              // Platform native Sub Agent candidate: one authenticated Codex session
+              // with digest-bound review units and one reconciled verdict.
+              '4b2e6283dcdb3feced57cf6f3a4746c7a2ca52d65f50a76a45e2957898e49ba0',
+              // Native Sub Agent fixed worker/unit coverage protocol.
+              '086e76be219a219cd466e8a0785ae9b6b9d3e9a5e3a9cf3bb4b8ca65bfe77649',
+              // Native same-session Sub Agent orchestration protocol.
+              '544f65158dab87376a913736b09865e50d333f8d31ba0132483ad470e16317b0',
+              // Native worker tool-enforcement protocol: the parent must spawn
+              // and await fixed workers; workers must fetch every bound unit.
+              '4642fc67c98c65f09dc6129b635d08be49051538c7c1745d154384e64721629d',
+              // Native worker assignment v2: one digest-bound MCP call returns
+              // every unit assigned to that worker for complete coverage.
+              'b9414ed00c2d9c403d4d0366c3212c495459b01163a586d0c7dff99c1282ffb8',
+              // Native assignment handoff v3: the parent reads each bound MCP
+              // payload and passes it inline because child agents do not inherit MCP.
+              '65201630b290f30e3b7088230db35bb791ad793aa3cc6efc7e1bfa2c81bf1a16',
+              // Native context file v1: parent passes only digest-bound file identities;
+              // each byte-balanced worker hashes and reads one isolated assignment file.
+              '220dc2dd475fead61d5b680f6e0ae877bd122da3c74bbada72b6948624db8dcd',
+              // Native worker read v1: workers may hash and read only their isolated assignment.
+              '9b250c681b659ccfa71fbf4a1c9c90181219dd4b3eab0801b680766d44fbfa60',
+              // Per-unit context v3: native workers read each digest-bound unit separately.
+              '61849815e1961f6e3c09e4894711452016bdc23ed13dbae843e0a2413272d81b',
+              '3c6f100e25ce3f493339da1aa83b755baba95fcbc48eb85edbbc86bc31203954',
+              'e4046ca832e13be1d04ad9cf5dc0aed0e3a236d51e4779b20b03dfac55eb015d',
+              '9193950b3ce6ceac2c1cbbc4d96217cea2dabaeba3ab27b9f4735d42bfc8dbf5',
+              '3a702e2fa7c8bdc0387d935ab7a7f2cef1e2e5d6dd28af1e9c2e28c7cdabced7',
+            ]);
             const changed = await github.paginate(github.rest.pulls.listFiles, {
               ...context.repo,
               pull_number: Number(process.env.PR_NUMBER),
               per_page: 100,
             });
             const expectedChangedFiles = changed.map((file) => file.filename).sort();
-            const highRiskPaths = changed.flatMap((file) =>
-              [file.filename, file.previous_filename].filter(Boolean),
-            );
-            const highRiskPatterns = [
-              /^\.github\/workflows\//,
-              /^(config|scripts)\/ci-runners\//,
-              /(^|\/)(auth|authorization|permissions?|rulesets?|secrets?|security)(\/|[-_.])/i,
-              /(^|\/)(deploy|deployment|production|terraform|tofu)(\/|[-_.])/i,
-              /(^|\/)_?middleware\.[cm]?[jt]sx?$/i,
-              /\.(tf|tfvars)$/i,
-            ];
-            const highRiskFiles = [...new Set(highRiskPaths.filter((file) =>
-              highRiskPatterns.some((pattern) => pattern.test(file)),
-            ))].sort();
             const isStringArray = (value) => Array.isArray(value) && value.every((item) => typeof item === 'string' && item.length > 0 && item.length <= 512);
             const sameSortedStrings = (value, expected) => isStringArray(value) &&
               [...value].sort().every((item, index) => item === expected[index]) && value.length === expected.length;
@@ -442,7 +813,9 @@ jobs:
             const coverageComplete = receipt && sameSortedStrings(receipt.changed_files, expectedChangedFiles) &&
               sameSortedStrings(receipt.reviewed_files, expectedChangedFiles) &&
               Array.isArray(receipt.omitted_files) && receipt.omitted_files.length === 0;
-            const valid = receipt &&
+            const reviewResultEnvelope = receipt &&
+              (receipt.result_kind === undefined || receipt.result_kind === 'review_result');
+            const contractValidExceptPolicyDigest = reviewResultEnvelope &&
               receipt.schema_version === '1.0' &&
               receipt.request_id === requestId &&
               receipt.pr_number === Number(process.env.PR_NUMBER) &&
@@ -459,25 +832,51 @@ jobs:
               isStringArray(receipt.reviewed_files) &&
               validOmissions(receipt.omitted_files, receipt.reviewed_files) &&
               validFindings(receipt.findings) &&
-              allowedPolicyDigests.has(receipt.policy_digest) &&
+              typeof receipt.policy_digest === 'string' &&
+              /^[0-9a-f]{64}$/.test(receipt.policy_digest) &&
               typeof receipt.runtime === 'object' && receipt.runtime !== null &&
               Object.keys(receipt.runtime).length === 2 &&
               Object.hasOwn(receipt.runtime, 'harness') && Object.hasOwn(receipt.runtime, 'version') &&
               typeof receipt.runtime.harness === 'string' && receipt.runtime.harness.length > 0 &&
               typeof receipt.runtime.version === 'string' && receipt.runtime.version.length > 0;
-            const clear = valid && receipt.decision === 'PASS' && receipt.analysis_complete === true && coverageComplete && receipt.findings.length === 0;
+            const parisCandidateDigest = '22436b564a2ee723af4b40328c14cab67d73b5effc5e7b1545fd69bc28e80ba1';
+            // Stage one records compatibility without accepting an inactive Agent.
+            // A separate reviewed activation revision must change this after
+            // Platform has deployed and read back the bound artifact.
+            const parisCandidateActive = false;
+            const policyDigestAllowed = contractValidExceptPolicyDigest && (
+              allowedPolicyDigests.has(receipt.policy_digest) ||
+              (parisCandidateActive && receipt.policy_digest === parisCandidateDigest &&
+                `${context.repo.owner}/${context.repo.repo}` === 'Schneider-Innovations/Project-QR')
+            );
+            const valid = contractValidExceptPolicyDigest && policyDigestAllowed;
+            // Policy v2: severity alone determines code blocking. First review,
+            // changed files, unavailable baseline comparisons and repeat reviews
+            // never promote medium/low to blocking. Identity, policy and complete
+            // coverage are still validated independently below.
+            const findingsForTiering = valid ? receipt.findings : [];
+            const blockingFinding = (finding) =>
+              finding.severity === 'critical' || finding.severity === 'high';
+            const blockingFindings = findingsForTiering.filter(blockingFinding);
+            const deferredFindings = findingsForTiering.filter((finding) => !blockingFinding(finding));
+            // The review contract permits PASS only with zero findings; a
+            // PASS that names findings is contradictory model output and
+            // stays fail-closed rather than being reinterpreted. Tiering
+            // therefore applies only to BLOCK receipts, where findings are
+            // mandatory -- a BLOCK naming no findings explains nothing and
+            // stays fail-closed too, as does INCONCLUSIVE.
+            const decisionAccountedFor = valid && (
+              (receipt.decision === 'PASS' && receipt.findings.length === 0) ||
+              (receipt.decision === 'BLOCK' && receipt.findings.length > 0)
+            );
+            const clear = valid && decisionAccountedFor && receipt.analysis_complete === true && coverageComplete && blockingFindings.length === 0;
             let conclusion = clear ? 'success' : 'failure';
-            let reason = !receipt
-              ? 'result_missing_or_malformed'
-              : !valid
-                ? 'result_contract_invalid'
-                : !clear && receipt.decision === 'PASS'
-                  ? 'review_coverage_incomplete'
-                  : `decision_${receipt.decision.toLowerCase()}`;
-            // A malformed bridge receipt must never influence the gate
-            // decision.  Preserve only a small, base-owned allowlist of
-            // producer diagnostics so an operational input/model failure is
-            // distinguishable from an arbitrary malformed JSON payload.
+            // An unavailable producer result is not a completed review
+            // contract, but a structurally valid diagnostic envelope must not
+            // be mislabeled as a contract violation. Only preserve a small,
+            // base-owned allowlist after binding the envelope to this exact
+            // request and merge preview. Arbitrary malformed JSON and identity
+            // mismatches remain result_contract_invalid.
             const bridgeDiagnosticCodes = new Set([
               'agent_internal_error',
               'broker_input_changed',
@@ -498,15 +897,164 @@ jobs:
               bridgeDiagnosticCodes.has(receipt.reason_code)
               ? receipt.reason_code
               : null;
-            let output = valid ? receipt : {
+            const bridgeFailureClasses = new Set([
+              'authentication',
+              'capacity',
+              'cli_contract',
+              'local_runtime',
+              'network',
+              'timeout',
+              'unknown',
+            ]);
+            const bridgeFailureSignals = new Set([
+              'authorization_denied',
+              'circuit_open',
+              'connection_reset',
+              'context_limit',
+              'deadline_exhausted',
+              'http_401',
+              'http_403',
+              'http_429',
+              'http_5xx',
+              'model_access',
+              'proxy_denied',
+              'rate_or_quota_limit',
+              'timeout',
+              'tls',
+            ]);
+            const bridge_failure_class = receipt?.reason_code === 'model_unavailable' &&
+              typeof receipt.failure_class === 'string' && bridgeFailureClasses.has(receipt.failure_class)
+              ? receipt.failure_class
+              : null;
+            const suppliedSignals = receipt?.reason_code === 'model_unavailable' &&
+              typeof receipt.failure_signals === 'string' && receipt.failure_signals !== 'none'
+              ? receipt.failure_signals.split(',')
+              : [];
+            const suppliedSignalsValid = receipt?.reason_code === 'model_unavailable' &&
+              typeof receipt.failure_signals === 'string' && (
+                receipt.failure_signals === 'none' || (
+                  suppliedSignals.length > 0 && suppliedSignals.length <= 6 &&
+                  suppliedSignals.every((signal, index) =>
+                    bridgeFailureSignals.has(signal) && suppliedSignals.indexOf(signal) === index)
+                )
+              );
+            const bridge_failure_signals = suppliedSignalsValid && suppliedSignals.length > 0
+              ? suppliedSignals
+              : [];
+            const bridge_retry_after_seconds = receipt?.reason_code === 'model_unavailable' &&
+              Number.isInteger(receipt.retry_after_seconds) &&
+              receipt.retry_after_seconds >= 1 && receipt.retry_after_seconds <= 900
+              ? receipt.retry_after_seconds
+              : null;
+            const contextFailureStages = new Set([
+              'inline_file_bytes',
+              'inline_context_bytes',
+              'javascript_outline_bytes',
+              'python_outline_bytes',
+              'model_stdin_bytes',
+              'reconciliation_context_bytes',
+              'reconciliation_stdin_bytes',
+              'full_coverage_source_bytes',
+              'full_coverage_source_lines',
+              'full_coverage_diff_bytes',
+              'full_coverage_diff_lines',
+            ]);
+            const contextFailureSupplied = receipt && Object.hasOwn(receipt, 'failure');
+            const suppliedContextFailure = receipt?.reason_code === 'review_context_too_large' &&
+              receipt.failure && typeof receipt.failure === 'object' && !Array.isArray(receipt.failure) &&
+              Object.keys(receipt.failure).sort().join(',') === 'actual_bytes,failure_stage,limit_bytes' &&
+              contextFailureStages.has(receipt.failure.failure_stage) &&
+              Number.isSafeInteger(receipt.failure.actual_bytes) &&
+              Number.isSafeInteger(receipt.failure.limit_bytes) &&
+              receipt.failure.actual_bytes > receipt.failure.limit_bytes &&
+              receipt.failure.limit_bytes > 0
+              ? {
+                  failure_stage: receipt.failure.failure_stage,
+                  actual_bytes: receipt.failure.actual_bytes,
+                  limit_bytes: receipt.failure.limit_bytes,
+                  unit: receipt.failure.failure_stage.endsWith('_lines') ? 'lines' : 'bytes',
+                }
+              : null;
+            const suppliedContextFailureValid = !contextFailureSupplied || suppliedContextFailure !== null;
+            const executionFailureEnvelope = receipt && (
+              receipt.result_kind === undefined || (
+                receipt.result_kind === 'execution_failure' &&
+                !Object.hasOwn(receipt, 'decision')
+              )
+            );
+            const diagnosticEnvelopeValid = executionFailureEnvelope &&
+              receipt.schema_version === '1.0' &&
+              receipt.mode === 'shadow' &&
+              receipt.request_id === requestId &&
+              receipt.head_sha === expectedHead &&
+              receipt.merge_sha === expectedMerge &&
+              receipt.status === 'unavailable' &&
+              bridge_reason_code !== null &&
+              suppliedContextFailureValid &&
+              (bridge_reason_code !== 'model_unavailable' || (
+                bridge_failure_class !== null &&
+                suppliedSignalsValid
+              ));
+            let reason = !receipt
+              ? processingDeadline === null
+                ? 'request_not_claimed'
+                : 'result_missing_or_malformed'
+              : contractValidExceptPolicyDigest && !policyDigestAllowed
+                ? 'policy_digest_not_allowed'
+              : diagnosticEnvelopeValid
+                ? bridge_reason_code
+              : !valid
+                ? 'result_contract_invalid'
+                : receipt.decision === 'PASS' && receipt.findings.length > 0
+                  ? 'decision_contract_violated'
+                  : !clear && receipt.decision === 'PASS'
+                    ? 'review_coverage_incomplete'
+                    : `decision_${receipt.decision.toLowerCase()}`;
+            const executionRetryable = diagnosticEnvelopeValid && (
+              receipt?.attempt?.last_failure_retryable === true ||
+              ['request_not_claimed', 'result_missing_or_malformed'].includes(reason)
+            );
+            let output = valid ? {
+              ...receipt,
+              result_kind: 'review_result',
+              execution: { status: 'succeeded', retryable: false },
+              review: { status: 'completed', decision: receipt.decision },
+            } : {
               schema_version: '1.0',
               mode: 'shadow',
               request_id: requestId,
               head_sha: expectedHead,
               merge_sha: expectedMerge,
               status: 'unavailable',
+              result_kind: 'execution_failure',
               reason_code: reason,
+              execution: {
+                status: 'failed',
+                failure_class: bridge_failure_class || (
+                  reason === 'policy_digest_not_allowed' ? 'policy' : 'receipt_protocol'
+                ),
+                retryable: executionRetryable,
+              },
+              review: { status: 'not_produced', decision: null },
               bridge_reason_code,
+              bridge_failure_class,
+              bridge_failure_signals,
+              bridge_retry_after_seconds,
+              context_failure: suppliedContextFailure,
+            };
+            output = {
+              ...output,
+              trusted_binding: {
+                schema: 'ai-review-head-binding/v1',
+                repository: `${context.repo.owner}/${context.repo.repo}`,
+                pr_number: Number(process.env.PR_NUMBER),
+                base_sha: expectedBase,
+                head_sha: expectedHead,
+                reviewed_merge_sha: expectedMerge,
+                merge_tree_sha: expectedMergeTree,
+                policy_digest: output.policy_digest || null,
+                request_generation: process.env.REQUEST_GENERATION,
+              },
             };
             let receiptText = JSON.stringify(output);
             // GitHub Checks accepts at most 65,535 characters. Keep a buffer
@@ -523,433 +1071,435 @@ jobs:
                 merge_sha: expectedMerge,
                 status: 'unavailable',
                 reason_code: reason,
+                trusted_binding: output.trusted_binding,
               };
               receiptText = JSON.stringify(output);
             }
-            const cliClear = conclusion === 'success';
-            const operationalEscalationReasons = new Set([
-              'result_missing_or_malformed',
-              'result_contract_invalid',
-              'review_coverage_incomplete',
-              'result_too_large',
-              'decision_inconclusive',
-            ]);
-            // A complete CLI BLOCK already contains actionable findings and
-            // remains blocking without spending a second reviewer call. A
-            // complete PASS on sensitive paths, or an unusable CLI result,
-            // requires an independent Connector review before these pending
-            // checks can be completed.
-            const escalationRequired = operationalEscalationReasons.has(reason) ||
-              (cliClear && highRiskFiles.length > 0);
-            core.setOutput('cli_clear', cliClear ? 'true' : 'false');
-            core.setOutput('cli_reason', reason);
-            core.setOutput('escalation_required', escalationRequired ? 'true' : 'false');
-            core.setOutput('escalation_reason', operationalEscalationReasons.has(reason)
-              ? `cli_${reason}`
-              : 'high_risk_paths');
-            core.setOutput('high_risk_files', JSON.stringify(highRiskFiles.slice(0, 50)));
-            if (escalationRequired) {
-              core.notice(`AI_CLI_REVIEW_CONNECTOR_ESCALATION_REQUIRED:${reason}`);
-              return;
-            }
+            // The structured, isolated CLI receipt is the sole merge-gate
+            // verdict. ChatGPT's GitHub Connector remains useful as a
+            // supplemental UI reviewer, but its human-facing prose is not a
+            // stable machine protocol and must never substitute for a missing
+            // or failed CLI receipt.
+            const contextFailureSummary = suppliedContextFailure
+              ? suppliedContextFailure.unit === 'lines'
+                ? `Review input exceeded ${suppliedContextFailure.failure_stage}: ` +
+                  `${suppliedContextFailure.actual_bytes} lines supplied, ` +
+                  `${suppliedContextFailure.limit_bytes} lines allowed.`
+                : `Review input exceeded ${suppliedContextFailure.failure_stage}: ` +
+                  `${Math.ceil(suppliedContextFailure.actual_bytes / 1024)} KiB supplied, ` +
+                  `${Math.ceil(suppliedContextFailure.limit_bytes / 1024)} KiB allowed.`
+              : null;
+            // Keep model-authored prose private. Expose only bounded, validated
+            // decision metadata and a stable link to the immutable Check run.
+            const originalCheckId = Number(process.env.HEAD_CHECK_RUN_ID);
+            const originalReceiptUrl = Number.isSafeInteger(originalCheckId) && originalCheckId > 0
+              ? `${process.env.GITHUB_SERVER_URL || 'https://github.com'}/${context.repo.owner}/${context.repo.repo}/runs/${originalCheckId}`
+              : null;
+            const diagnostic = output.decision === 'INCONCLUSIVE'
+              ? output.inconclusive_diagnostics : null;
+            const validDiagnostic = diagnostic?.schema_version === '1.0' &&
+              Array.isArray(diagnostic.inconclusive_batches) &&
+              diagnostic.inconclusive_batches.length <= 32 &&
+              diagnostic.inconclusive_batches.every((batch) =>
+                Number.isSafeInteger(batch?.batch_number) && batch.batch_number > 0 &&
+                Number.isSafeInteger(batch?.reviewed_path_count) && batch.reviewed_path_count >= 0 &&
+                /^[0-9a-f]{64}$/.test(batch?.reviewed_paths_digest || '')) &&
+              (['single_batch', 'comprehensive_retry', 'cross_batch_reconciliation'].includes(diagnostic.final_review?.mode) ||
+                (diagnostic.final_review?.mode === 'none' && diagnostic.final_review?.outcome === 'not_run')) &&
+              ['PASS', 'BLOCK', 'INCONCLUSIVE', 'not_run'].includes(diagnostic.final_review?.outcome);
+            // Expose a fixed diagnostic, never arbitrary model prose or source content.
+            const transportOmissions = validDiagnostic && Array.isArray(output.omitted_files)
+              ? output.omitted_files.filter((item) => item?.reason === 'Required unit context was transport-truncated.').length
+              : 0;
+            const publicCause = transportOmissions > 0
+              ? `${transportOmissions} file(s) could not be reviewed because unit context was transport-truncated. `
+              : '';
+            const inconclusiveExplanation = output.decision === 'INCONCLUSIVE'
+              ? validDiagnostic
+                ? `${diagnostic.inconclusive_batches.length} bounded batch(es) returned INCONCLUSIVE; ` +
+                  `${diagnostic.final_review.mode} ended ${diagnostic.final_review.outcome}. ` +
+                  publicCause + 'Inspect the original receipt for bounded diagnostics and any final-review skip reason.'
+                : 'explanation_unavailable: the producer supplied no valid public diagnostic.'
+              : null;
+            const diagnosticLink = originalReceiptUrl
+              ? ` Original exact-head receipt: [check ${originalCheckId}](${originalReceiptUrl}).`
+              : ' Original receipt link unavailable.';
             const checkOutput = {
-              title: conclusion === 'success' ? 'Codex CLI reviewed current head' : 'Codex CLI review receipt not ready',
-              summary: conclusion === 'success' ? output.summary : `Fail-closed Shadow result: ${reason}.`,
+              title: conclusion === 'success'
+                ? 'Codex CLI reviewed current head'
+                : suppliedContextFailure
+                  ? 'Codex CLI review context exceeds configured limit'
+                  : 'Codex CLI review receipt not ready',
+              summary: conclusion === 'success'
+                ? `${output.summary}${mergeRefObservation}`
+                : (contextFailureSummary || `Fail-closed Shadow result: ${reason}.`) +
+                  (bridge_failure_class
+                    ? ` Producer diagnostic: ${bridge_failure_class}` +
+                      (bridge_failure_signals.length > 0 ? ` (${bridge_failure_signals.join(', ')})` : '') +
+                      (bridge_retry_after_seconds ? `; retry after ${bridge_retry_after_seconds}s` : '') + '.'
+                    : '') +
+                  mergeRefObservation +
+                  (inconclusiveExplanation ? ` ${inconclusiveExplanation}${diagnosticLink}` : ''),
               text: receiptText,
             };
-            await github.rest.checks.update({
+            // Project only a verified, exact-head receipt. Deleted paths have
+            // no line in the head commit and therefore remain summary-only.
+            // All other coordinate failures are handled by the bounded 422
+            // fallback below so presentation can never strand the merge gate.
+            const changedStatusByPath = new Map(changed.map((file) => [file.filename, file.status]));
+            const projectableFindings = valid && reason !== 'result_too_large'
+              ? findingsForTiering
+              : [];
+            const findingAnnotations = projectableFindings
+              .filter((finding) => changedStatusByPath.get(finding.path) !== 'removed')
+              .map((finding) => {
+                const disposition = blockingFinding(finding) ? 'blocking' : 'deferred';
+                return {
+                  path: finding.path,
+                  start_line: finding.line,
+                  end_line: finding.line,
+                  annotation_level: disposition === 'blocking' ? 'failure' : 'warning',
+                  title: `[${finding.severity.toUpperCase()}] ${finding.title}`,
+                  message: finding.explanation,
+                  raw_details: `Receipt severity: ${finding.severity}; disposition: ${disposition}.`,
+                };
+              });
+            const projectionRecord = projectableFindings.length > 0
+              ? `\n\nFinding projection: ${findingAnnotations.length}/${projectableFindings.length} line annotation(s) on the head receipt Check; ` +
+                `${projectableFindings.length - findingAnnotations.length} summary-only.`
+              : '';
+            if (projectionRecord) checkOutput.summary += projectionRecord;
+            // Version 2 is deliberately incompatible with the v1 issue projector.
+            // Old immutable projectors reject it rather than create one issue per
+            // finding. Complete explanations remain in the receipt text.
+            // The deferred record rides in the summary, never in the text:
+            // the finalizer and downstream consumers parse text as the bare
+            // receipt JSON. Findings are bounded (25 max, titles <= 240), so
+            // this stays far below the Checks output limit.
+            if (clear && deferredFindings.length > 0) {
+              const deferredRecord = {
+                schema: 'ai-review-deferred/v2',
+                pr_number: Number(process.env.PR_NUMBER),
+                head_sha: expectedHead,
+                policy: 'severity-record-only/v2',
+                issue_projection: 'disabled',
+                deferred: deferredFindings.map((finding) => ({
+                  severity: finding.severity,
+                  path: finding.path,
+                  line: finding.line,
+                  title: finding.title,
+                  disposition: 'record_only',
+                  reason: finding.severity === 'medium'
+                    ? 'deferred_without_merge_block' : 'low_priority_no_issue',
+                })),
+              };
+              // The marker anchors the projector: the model-authored receipt
+              // summary above is only length-validated and could itself carry
+              // a fenced JSON block, so the base-owned record is always the
+              // fence following the LAST marker occurrence -- this append
+              // runs after any untrusted text.
+              checkOutput.summary = `${checkOutput.summary} ${deferredFindings.length} non-blocking finding(s) retained in the complete receipt; no automatic issues created.\n\n<!-- ai-review-deferred-record -->\n\`\`\`json\n${JSON.stringify(deferredRecord)}\n\`\`\``;
+            }
+            const headCheckParameters = {
               ...context.repo,
               check_run_id: Number(process.env.HEAD_CHECK_RUN_ID),
               status: 'completed',
               conclusion,
               completed_at: new Date().toISOString(),
-              output: checkOutput,
-            });
-            await github.rest.checks.update({
-              ...context.repo,
-              check_run_id: Number(process.env.MERGE_CHECK_RUN_ID),
-              status: 'completed',
-              conclusion,
-              completed_at: new Date().toISOString(),
-              output: checkOutput,
-            });
+              output: findingAnnotations.length > 0
+                ? { ...checkOutput, annotations: findingAnnotations }
+                : checkOutput,
+            };
+            try {
+              await github.rest.checks.update(headCheckParameters);
+            } catch (error) {
+              // GitHub rejects the whole update when even one annotation line
+              // cannot be resolved in the head commit. Retry exactly once
+              // without annotations, preserving every finding in receipt text.
+              if (error?.status !== 422 || findingAnnotations.length === 0) throw error;
+              const fallbackRecord = `\n\nFinding projection: 0/${projectableFindings.length} line annotations; ` +
+                `${projectableFindings.length} summary-only because GitHub rejected the receipt coordinates.`;
+              checkOutput.summary = checkOutput.summary.replace(projectionRecord, fallbackRecord);
+              core.warning('AI_CLI_REVIEW_FINDING_ANNOTATIONS_REJECTED');
+              await github.rest.checks.update({
+                ...headCheckParameters,
+                output: checkOutput,
+              });
+            }
+            try {
+              await assertCurrentReviewBinding();
+            } catch (error) {
+              await github.rest.checks.update({
+                ...context.repo,
+                check_run_id: Number(process.env.HEAD_CHECK_RUN_ID),
+                status: 'completed', conclusion: 'failure', completed_at: new Date().toISOString(),
+                output: { title: 'Codex CLI review binding changed',
+                  summary: 'Fail-closed: base, head, merge preview, or merge tree changed during publication.' },
+              });
+              throw error;
+            }
+            // Publish two machine-readable gates with different authority.
+            // Execution answers whether a trustworthy review result exists;
+            // verdict answers what that result decided. Infrastructure failure
+            // never becomes an INCONCLUSIVE code-review decision.
+            const executionSucceeded = output.result_kind === 'review_result';
+            const executionOutput = {
+              title: executionSucceeded
+                ? 'AI review execution succeeded'
+                : 'AI review execution failed',
+              summary: executionSucceeded
+                ? 'A schema-valid, exact-head review result was produced.'
+                : `No review verdict was produced: ${reason}.`,
+              text: JSON.stringify({
+                schema_version: '2.0',
+                request_id: requestId,
+                head_sha: expectedHead,
+                merge_sha: expectedMerge,
+                ...output.execution,
+              }),
+            };
+            const verdictPassed = executionSucceeded && clear;
+            const verdictOutput = {
+              title: !executionSucceeded
+                ? 'AI review verdict not produced'
+                : verdictPassed
+                  ? 'AI review verdict passed'
+                  : 'AI review verdict blocked',
+              summary: !executionSucceeded
+                ? 'Execution failed before a trustworthy code verdict existed.'
+                : verdictPassed
+                  ? 'The exact-head review satisfied the severity and coverage policy.'
+                  : `The exact-head review did not satisfy the verdict gate: ${reason}.` +
+                    (inconclusiveExplanation ? ` ${inconclusiveExplanation}${diagnosticLink}` : ''),
+              text: JSON.stringify({
+                schema_version: '2.0',
+                request_id: requestId,
+                head_sha: expectedHead,
+                merge_sha: expectedMerge,
+                base_sha: output.base_sha || null,
+                workflow_run_id: context.runId,
+                workflow_run_attempt: reviewRunAttempt,
+                original_receipt_check_run_id: originalReceiptUrl ? originalCheckId : null,
+                original_receipt_url: originalReceiptUrl,
+                inconclusive_explanation: inconclusiveExplanation,
+                inconclusive_explanation_code: inconclusiveExplanation
+                  ? validDiagnostic ? 'producer_decision_metadata' : 'explanation_unavailable'
+                  : null,
+                status: executionSucceeded ? 'completed' : 'not_produced',
+                // This check exposes the policy gate, not the raw model vote.
+                // Preserve that vote separately (medium-only BLOCK may pass).
+                decision: executionSucceeded ? (verdictPassed ? 'PASS' : 'BLOCK') : null,
+                review_decision: executionSucceeded ? receipt.decision : null,
+              }),
+            };
+            const publishSplitGate = async (name, gateConclusion, gateOutput) => {
+              await github.rest.checks.create({
+                ...context.repo,
+                name,
+                head_sha: expectedHead,
+                status: 'completed',
+                conclusion: gateConclusion,
+                completed_at: new Date().toISOString(),
+                external_id: `${name}:${process.env.PR_NUMBER}:${expectedHead}:${expectedMerge}:${context.runId}:head`,
+                output: gateOutput,
+              });
+            };
+            await publishSplitGate(
+              'ai-review/execution', executionSucceeded ? 'success' : 'failure', executionOutput,
+            );
+            await publishSplitGate(
+              'ai-review/verdict', verdictPassed ? 'success' : 'failure', verdictOutput,
+            );
+            core.setOutput('receipt_protocol', resultPath === readyPath ? 'ready-v2' : 'legacy-v1');
             if (conclusion !== 'success') {
               core.setFailed(`AI_CLI_REVIEW_NOT_READY:${reason}`);
             }
 
-      - id: connector-request
-        name: Request independent Connector review when required
-        if: always() && steps.receipt.outputs.escalation_required == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
-        env:
-          PR_NUMBER: ${{ needs.prepare-cli-review.outputs.pr_number }}
-          HEAD_SHA: ${{ needs.prepare-cli-review.outputs.head_sha }}
-          MERGE_SHA: ${{ needs.prepare-cli-review.outputs.merge_sha }}
-          BASE_BRANCH: ${{ inputs.base_branch }}
-          REQUIRED_LABEL: ${{ inputs.required_label }}
-          REQUESTER_LOGIN: ${{ inputs.requester_login }}
-          ESCALATION_REASON: ${{ steps.receipt.outputs.escalation_reason }}
-          HIGH_RISK_FILES: ${{ steps.receipt.outputs.high_risk_files }}
-        with:
-          github-token: ${{ secrets.codex_trigger_token }}
-          script: |
-            const { owner, repo } = context.repo;
-            const prNumber = Number(process.env.PR_NUMBER);
-            const headSha = process.env.HEAD_SHA;
-            const mergeSha = process.env.MERGE_SHA;
-            const requesterLogin = process.env.REQUESTER_LOGIN.toLowerCase();
-            if (
-              !Number.isInteger(prNumber) || prNumber <= 0 ||
-              !/^[0-9a-f]{40}$/.test(headSha) ||
-              !/^[0-9a-f]{40}$/.test(mergeSha) ||
-              !requesterLogin
-            ) {
-              core.setFailed('AI_CONNECTOR_ESCALATION_CONFIGURATION_INVALID');
-              return;
-            }
-            let authenticated;
-            try {
-              authenticated = (await github.rest.users.getAuthenticated()).data;
-            } catch {
-              core.setFailed('AI_CONNECTOR_ESCALATION_TOKEN_UNAVAILABLE');
-              return;
-            }
-            if (authenticated.login?.toLowerCase() !== requesterLogin) {
-              core.setFailed('AI_CONNECTOR_ESCALATION_IDENTITY_MISMATCH');
-              return;
-            }
-            const pr = (await github.rest.pulls.get({ owner, repo, pull_number: prNumber })).data;
-            const currentMerge = (await github.rest.git.getRef({
-              owner,
-              repo,
-              ref: `pull/${prNumber}/merge`,
-            })).data.object?.sha?.toLowerCase();
-            if (
-              pr.state !== 'open' || pr.draft ||
-              pr.base.ref !== process.env.BASE_BRANCH ||
-              pr.head.repo?.full_name !== `${owner}/${repo}` ||
-              pr.head.sha.toLowerCase() !== headSha ||
-              currentMerge !== mergeSha ||
-              !pr.labels.some((label) => label.name === process.env.REQUIRED_LABEL)
-            ) {
-              core.setFailed('AI_CONNECTOR_ESCALATION_CONTEXT_CHANGED');
-              return;
-            }
-            const marker = `<!-- si-ai-review-escalation head=${headSha} merge=${mergeSha} -->`;
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner,
-              repo,
-              issue_number: prNumber,
-              per_page: 100,
-            });
-            const existing = comments.find((comment) =>
-              comment.user?.login?.toLowerCase() === requesterLogin &&
-              comment.body?.includes(marker),
-            );
-            const highRiskFiles = (() => {
-              try { return JSON.parse(process.env.HIGH_RISK_FILES || '[]'); } catch { return []; }
-            })();
-            const boundedFiles = Array.isArray(highRiskFiles)
-              ? highRiskFiles.filter((item) => typeof item === 'string').slice(0, 20)
-              : [];
-            const fileNote = boundedFiles.length
-              ? `\n\nHigh-risk paths:\n${boundedFiles.map((file) => `- \`${file}\``).join('\n')}`
-              : '';
-            const request = existing || (await github.rest.issues.createComment({
-              owner,
-              repo,
-              issue_number: prNumber,
-              body: `${marker}\n\n@codex review\n\nIndependent deep review required for exact head \`${headSha}\` (merge preview \`${mergeSha}\`). Trigger: \`${process.env.ESCALATION_REASON}\`. Report \`Reviewed commit:\` and either findings as \`[P0]\`-\`[P3]\` or the explicit phrase \`No major issues found.\`${fileNote}\n\nThis request is deduplicated by exact head and is not approval.`,
-            })).data;
-            if (!request.html_url || !request.created_at) {
-              core.setFailed('AI_CONNECTOR_ESCALATION_REQUEST_INVALID');
-              return;
-            }
-            core.setOutput('request_comment_url', request.html_url);
-            core.setOutput('request_comment_id', String(request.id));
-            core.setOutput('started_at', request.created_at);
-
-      - id: connector-evidence
-        name: Verify independent Connector evidence
-        if: always() && steps.receipt.outputs.escalation_required == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
-        env:
-          HEAD_CHECK_RUN_ID: ${{ needs.prepare-cli-review.outputs.head_check_run_id }}
-          MERGE_CHECK_RUN_ID: ${{ needs.prepare-cli-review.outputs.merge_check_run_id }}
-          HEAD_SHA: ${{ needs.prepare-cli-review.outputs.head_sha }}
-          MERGE_SHA: ${{ needs.prepare-cli-review.outputs.merge_sha }}
-          BASE_BRANCH: ${{ inputs.base_branch }}
-          PR_NUMBER: ${{ needs.prepare-cli-review.outputs.pr_number }}
-          CLI_CLEAR: ${{ steps.receipt.outputs.cli_clear }}
-          CLI_REASON: ${{ steps.receipt.outputs.cli_reason }}
-          ESCALATION_REASON: ${{ steps.receipt.outputs.escalation_reason }}
-          REQUEST_COMMENT_URL: ${{ steps.connector-request.outputs.request_comment_url }}
-          REQUEST_COMMENT_ID: ${{ steps.connector-request.outputs.request_comment_id }}
-          STARTED_AT: ${{ steps.connector-request.outputs.started_at }}
-        with:
-          script: |
-            const { owner, repo } = context.repo;
-            const prNumber = Number(process.env.PR_NUMBER);
-            const headSha = process.env.HEAD_SHA;
-            const mergeSha = process.env.MERGE_SHA;
-            const startedAtMilliseconds = Date.parse(process.env.STARTED_AT || '');
-            const reviewerLogins = new Set([
-              'chatgpt-codex-connector',
-              'chatgpt-codex-connector[bot]',
-            ]);
-            let connectorStatus = 'request_failed';
-            let connectorReason = 'connector_request_failed';
-            let evidenceUrl = null;
-            let reviewedSha = null;
-            if (Number.isFinite(startedAtMilliseconds)) {
-              let deadline = Date.now() + 720 * 1000;
-              let delaySeconds = 0;
-              let cleanFirstSeenAt = null;
-              let confirmationExtended = false;
-              let formatFirstSeenAt = null;
-              connectorStatus = 'unavailable';
-              connectorReason = 'connector_timeout';
-              while (true) {
-                if (delaySeconds > 0) {
-                  const remainingMilliseconds = deadline - Date.now();
-                  if (remainingMilliseconds <= 0) break;
-                  await new Promise((resolve) => setTimeout(
-                    resolve,
-                    Math.min(delaySeconds * 1000, remainingMilliseconds),
-                  ));
-                }
-                const comments = await github.paginate(github.rest.issues.listComments, {
-                  owner,
-                  repo,
-                  issue_number: prNumber,
-                  per_page: 100,
-                });
-                const reviews = await github.paginate(github.rest.pulls.listReviews, {
-                  owner,
-                  repo,
-                  pull_number: prNumber,
-                  per_page: 100,
-                });
-                const reviewComments = await github.paginate(
-                  github.rest.pulls.listReviewComments,
-                  { owner, repo, pull_number: prNumber, per_page: 100 },
-                );
-                const reviewCandidates = reviews.map((review) => ({
-                    body: review.body || '',
-                    createdAt: review.submitted_at,
-                    login: review.user?.login?.toLowerCase(),
-                    url: review.html_url,
-                    reviewedSha: review.commit_id,
-                    inlineFindingUrls: [],
-                  }));
-                const inlineCandidates = [];
-                for (const comment of reviewComments) {
-                  const login = comment.user?.login?.toLowerCase();
-                  if (reviewerLogins.has(login)) {
-                    inlineCandidates.push({
-                      body: comment.body || '',
-                      createdAt: comment.created_at,
-                      login,
-                      url: comment.html_url,
-                      // GitHub may anchor a fresh inline finding to an older
-                      // line commit. Identity plus post-request creation time
-                      // is sufficient because every trusted inline comment is
-                      // conservatively treated as a finding below.
-                      reviewedSha: headSha,
-                      inlineFindingUrls: [comment.html_url],
-                    });
-                  }
-                }
-                const candidates = [
-                  ...comments.map((item) => ({
-                    body: item.body || '', createdAt: item.created_at,
-                    login: item.user?.login?.toLowerCase(), url: item.html_url,
-                  })),
-                  ...reviewCandidates,
-                  ...inlineCandidates,
-                ].filter((item) =>
-                  reviewerLogins.has(item.login) && item.createdAt &&
-                  Date.parse(item.createdAt) >= startedAtMilliseconds,
-                );
-                const exactCandidates = [];
-                let staleCandidate = null;
-                for (const candidate of candidates) {
-                  const match = candidate.body.match(
-                    /Reviewed commit:\*?\*?\s*`?([0-9a-f]{7,40})`?/i,
-                  );
-                  if (!candidate.reviewedSha && !match) {
-                    if (/usage limits|rate limit|limit.*review/i.test(candidate.body)) {
-                      connectorReason = 'connector_unavailable';
-                    }
-                    continue;
-                  }
-                  reviewedSha = (candidate.reviewedSha || match[1]).toLowerCase();
-                  if (reviewedSha.length < 40) {
-                    try {
-                      reviewedSha = (await github.rest.repos.getCommit({
-                        owner, repo, ref: reviewedSha,
-                      })).data.sha.toLowerCase();
-                    } catch {
-                      connectorReason = 'connector_evidence_unparseable';
-                      continue;
-                    }
-                  }
-                  if (reviewedSha !== headSha) {
-                    staleCandidate = { url: candidate.url, sha: reviewedSha };
-                    continue;
-                  }
-                  exactCandidates.push(candidate);
-                }
-                let cleanReaction = null;
-                const requestCommentId = Number(process.env.REQUEST_COMMENT_ID);
-                if (Number.isInteger(requestCommentId) && requestCommentId > 0) {
-                  const reactions = await github.paginate(
-                    github.rest.reactions.listForIssueComment,
-                    { owner, repo, comment_id: requestCommentId, per_page: 100 },
-                  );
-                  cleanReaction = reactions.find((reaction) =>
-                    reaction.content === '+1' &&
-                    reviewerLogins.has(reaction.user?.login?.toLowerCase()) &&
-                    (!reaction.created_at || Date.parse(reaction.created_at) >= startedAtMilliseconds),
-                  ) || null;
-                }
-                const finding = exactCandidates.find((candidate) =>
-                  candidate.inlineFindingUrls?.length > 0 ||
-                    /\[P[0-3](?:\s+Badge)?\]/i.test(candidate.body),
-                );
-                const clean = exactCandidates.find((candidate) =>
-                  /no major issues found\.?/i.test(candidate.body) ||
-                    /未发现.{0,12}(重大|主要).{0,8}问题/i.test(candidate.body),
-                );
-                // Aggregate the parent review and every inline review comment.
-                // Findings always win, regardless of API ordering or an earlier
-                // clean comment. A clean signal must survive another poll so a
-                // later inline finding cannot race a successful Check update.
-                if (finding) {
-                  connectorStatus = 'blocked';
-                  connectorReason = 'connector_findings_present';
-                  evidenceUrl = finding.inlineFindingUrls?.[0] || finding.url;
-                  break;
-                }
-                if (clean || cleanReaction) {
-                  evidenceUrl = clean?.url || process.env.REQUEST_COMMENT_URL;
-                  reviewedSha = headSha;
-                  cleanFirstSeenAt ||= Date.now();
-                  if (!confirmationExtended && deadline - cleanFirstSeenAt < 45 * 1000) {
-                    deadline = cleanFirstSeenAt + 45 * 1000;
-                    confirmationExtended = true;
-                  }
-                  if (Date.now() - cleanFirstSeenAt >= 30 * 1000) {
-                    connectorStatus = 'passed';
-                    connectorReason = 'connector_clean';
-                    break;
-                  }
-                } else {
-                  cleanFirstSeenAt = null;
-                  if (exactCandidates.length > 0) {
-                    evidenceUrl = exactCandidates[0].url;
-                    formatFirstSeenAt ||= Date.now();
-                    if (Date.now() - formatFirstSeenAt >= 30 * 1000) {
-                      connectorStatus = 'inconclusive';
-                      connectorReason = 'connector_format_invalid';
-                      break;
-                    }
-                  } else {
-                    formatFirstSeenAt = null;
-                  }
-                }
-                if (staleCandidate) {
-                  connectorStatus = 'stale';
-                  connectorReason = 'connector_reviewed_sha_stale';
-                  evidenceUrl = staleCandidate.url;
-                  reviewedSha = staleCandidate.sha;
-                }
-                const remainingSeconds = Math.floor((deadline - Date.now()) / 1000);
-                if (remainingSeconds <= 0) break;
-                delaySeconds = delaySeconds === 0
-                  ? 60
-                  : Math.min(delaySeconds * 2, 300, remainingSeconds);
-              }
-            }
-            let currentContext = false;
-            try {
-              const pr = (await github.rest.pulls.get({ owner, repo, pull_number: prNumber })).data;
-              const currentMerge = (await github.rest.git.getRef({
-                owner,
-                repo,
-                ref: `pull/${prNumber}/merge`,
-              })).data.object?.sha?.toLowerCase();
-              currentContext = pr.state === 'open' && !pr.draft &&
-                pr.base.ref === process.env.BASE_BRANCH &&
-                pr.head.repo?.full_name === `${owner}/${repo}` &&
-                pr.head.sha.toLowerCase() === headSha && currentMerge === mergeSha;
-            } catch {
-              currentContext = false;
-            }
-            if (!currentContext) {
-              connectorStatus = 'stale';
-              connectorReason = 'connector_context_changed';
-            }
-            // A trusted exact-head Connector review may substitute only for an
-            // unusable CLI result. A complete CLI BLOCK is intentionally not
-            // escalated, while clean high-risk CLI results still require both
-            // reviewers to pass.
-            const connectorSubstitutionReasons = new Set([
-              'result_missing_or_malformed',
-              'result_contract_invalid',
-              'review_coverage_incomplete',
-              'result_too_large',
-              'decision_inconclusive',
-            ]);
-            const connectorSubstituted = connectorSubstitutionReasons.has(process.env.CLI_REASON) &&
-              connectorStatus === 'passed';
-            const finalClear = connectorStatus === 'passed' &&
-              (process.env.CLI_CLEAR === 'true' || connectorSubstituted);
-            const output = {
-              schema_version: '1.0',
-              mode: 'shadow',
-              head_sha: headSha,
-              merge_sha: mergeSha,
-              cli_clear: process.env.CLI_CLEAR === 'true',
-              connector_substituted_for_unusable_cli: connectorSubstituted,
-              cli_reason: process.env.CLI_REASON,
-              escalation_reason: process.env.ESCALATION_REASON,
-              connector_status: connectorStatus,
-              connector_reason: connectorReason,
-              connector_reviewed_sha: reviewedSha,
-              request_comment_url: process.env.REQUEST_COMMENT_URL || null,
-              review_evidence_url: evidenceUrl,
-            };
-            const checkOutput = {
-              title: finalClear ? 'CLI and Connector reviewed current merge' : 'Conditional deep review not ready',
-              summary: finalClear
-                ? `Independent Connector evidence: ${evidenceUrl}.`
-                : `Fail-closed Shadow result: ${connectorReason}; CLI: ${process.env.CLI_REASON}.`,
-              text: JSON.stringify(output, null, 2),
-            };
-            for (const checkRunId of [process.env.HEAD_CHECK_RUN_ID, process.env.MERGE_CHECK_RUN_ID]) {
-              await github.rest.checks.update({
-                ...context.repo,
-                check_run_id: Number(checkRunId),
-                status: 'completed',
-                conclusion: finalClear ? 'success' : 'failure',
-                completed_at: new Date().toISOString(),
-                output: checkOutput,
-              });
-            }
-            if (!finalClear) {
-              core.setFailed(`AI_CONNECTOR_REVIEW_NOT_READY:${connectorReason}`);
-            }
-
       - name: Remove submitted snapshot
+        id: terminalize
         if: always()
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
           REQUEST_ID: ${{ needs.prepare-cli-review.outputs.request_id }}
+          CANCEL_SUBJECT_DIGEST: ${{ needs.prepare-cli-review.outputs.cancel_subject_digest }}
+          CANCEL_ATTEMPT_NUMBER: ${{ needs.prepare-cli-review.outputs.cancel_attempt_number }}
+          PRODUCER_RECEIPT_OBSERVED: ${{ steps.receipt.outputs.producer_receipt_observed }}
         with:
           script: |
             const fs = require('fs');
             const path = require('path');
+            // This step also runs when verification is cancelled. Record that
+            // this exact consumer is done BEFORE deleting the input. The broker
+            // retains the empty tombstone and removes even a later receipt.
+            const requestId = process.env.REQUEST_ID || '';
+            if (!/^cli-[0-9]+-[0-9]+-[0-9]+-[0-9a-f]+$/.test(requestId)) {
+              core.setFailed('AI_CLI_REVIEW_TERMINAL_REQUEST_INVALID');
+              return;
+            }
+            if (process.env.PRODUCER_RECEIPT_OBSERVED !== 'true') {
+              const digest = process.env.CANCEL_SUBJECT_DIGEST || '';
+              const attempt = Number(process.env.CANCEL_ATTEMPT_NUMBER);
+              if (!/^[0-9a-f]{64}$/.test(digest) || !Number.isSafeInteger(attempt) || attempt < 1) {
+                core.setFailed('AI_CLI_REVIEW_CANCEL_BINDING_INVALID');
+                return;
+              }
+              const cancelIncoming = '/var/lib/codex-review-bridge/cancel-incoming';
+              const cancelAcks = '/var/lib/codex-review-bridge/cancel-acks';
+              const sequence = 1;
+              const command = {
+                schema_version: '2.0', request_id: requestId, cancel_sequence: sequence,
+                reason: 'expired', created_at: new Date().toISOString(),
+                subject_digest: digest, lease_generation: 1, attempt_number: attempt,
+              };
+              const target = path.join(cancelIncoming, `${requestId}.${sequence}.json`);
+              const temporary = path.join(cancelIncoming, `.${requestId}.${sequence}.${process.pid}.tmp`);
+              fs.writeFileSync(temporary, `${JSON.stringify(command)}\n`, { flag: 'wx', mode: 0o600 });
+              const temporaryFd = fs.openSync(temporary, 'r');
+              try { fs.fsyncSync(temporaryFd); } finally { fs.closeSync(temporaryFd); }
+              try { fs.linkSync(temporary, target); } catch (error) {
+                if (error.code !== 'EEXIST') throw error;
+              } finally {
+                fs.rmSync(temporary);
+              }
+              const cancelDirectoryFd = fs.openSync(cancelIncoming, 'r');
+              try { fs.fsyncSync(cancelDirectoryFd); } finally { fs.closeSync(cancelDirectoryFd); }
+              const ackPath = path.join(cancelAcks, `${requestId}.${sequence}.json`);
+              const deadline = Date.now() + 60 * 1000;
+              let resolution = null;
+              while (Date.now() < deadline) {
+                if (fs.existsSync(ackPath)) {
+                  resolution = JSON.parse(fs.readFileSync(ackPath, 'utf8'));
+                  break;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 1000));
+              }
+              if (!resolution || resolution.request_id !== requestId ||
+                  resolution.cancel_sequence !== sequence ||
+                  !['ACCEPTED', 'OBSOLETE_AFTER_TERMINAL'].includes(resolution.state)) {
+                core.setFailed('AI_CLI_REVIEW_CANCEL_NOT_ACCEPTED');
+                return;
+              }
+              core.info(`AI_CLI_REVIEW_CANCEL_${resolution.state}`);
+            }
+            const ready = '/var/lib/codex-review-bridge/outgoing/ready';
+            const marker = path.join(ready, `${requestId}.terminal`);
+            try {
+              const fd = fs.openSync(marker, 'wx', 0o600);
+              try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+            } catch (error) {
+              if (error.code !== 'EEXIST') throw error;
+              const metadata = fs.lstatSync(marker);
+              if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size !== 0 ||
+                  metadata.uid !== process.getuid() || (metadata.mode & 0o777) !== 0o600) {
+                throw new Error('AI_CLI_REVIEW_TERMINAL_MARKER_INVALID');
+              }
+            }
+            const directoryFd = fs.openSync(ready, 'r');
+            try { fs.fsyncSync(directoryFd); } finally { fs.closeSync(directoryFd); }
+            const root = path.resolve('/var/lib/codex-review-bridge/incoming');
+            const target = path.resolve(root, process.env.REQUEST_ID);
+            if (!target.startsWith(`${root}${path.sep}`)) {
+              core.setFailed('AI_CLI_REVIEW_CLEANUP_PATH_INVALID');
+              return;
+            }
+            fs.rmSync(target, { recursive: true, force: true });
+            // The broker treats this durable tombstone as the acknowledgement
+            // for both an already-visible receipt and any later publication.
+            // Expose completion so the fallback job consumes a review slot only
+            // when this verifier never started or was interrupted mid-cleanup.
+            core.setOutput('consumer_terminalized', 'true');
+
+  terminalize-submitted-review:
+    name: Terminalize submitted review consumer
+    needs: [prepare-cli-review, await-cli-review]
+    if: >-
+      always() &&
+      needs.prepare-cli-review.outputs.request_id != '' &&
+      needs.await-cli-review.outputs.consumer_terminalized != 'true'
+    runs-on:
+      group: code-review
+      labels: [self-hosted, code-review, cli-review, shadow-only]
+    timeout-minutes: 3
+    steps:
+      - name: Mark consumer terminal after verifier scheduling
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          REQUEST_ID: ${{ needs.prepare-cli-review.outputs.request_id }}
+          CANCEL_SUBJECT_DIGEST: ${{ needs.prepare-cli-review.outputs.cancel_subject_digest }}
+          CANCEL_ATTEMPT_NUMBER: ${{ needs.prepare-cli-review.outputs.cancel_attempt_number }}
+          PRODUCER_RECEIPT_OBSERVED: ${{ needs.await-cli-review.outputs.producer_receipt_observed }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            // A workflow cancellation can stop a queued verifier before any
+            // of its steps start. This separate always-scheduled job closes
+            // that gap after the verifier reaches any terminal job result.
+            const requestId = process.env.REQUEST_ID || '';
+            if (!/^cli-[0-9]+-[0-9]+-[0-9]+-[0-9a-f]+$/.test(requestId)) {
+              core.setFailed('AI_CLI_REVIEW_TERMINAL_REQUEST_INVALID');
+              return;
+            }
+            if (process.env.PRODUCER_RECEIPT_OBSERVED !== 'true') {
+              const digest = process.env.CANCEL_SUBJECT_DIGEST || '';
+              const attempt = Number(process.env.CANCEL_ATTEMPT_NUMBER);
+              if (!/^[0-9a-f]{64}$/.test(digest) || !Number.isSafeInteger(attempt) || attempt < 1) {
+                core.setFailed('AI_CLI_REVIEW_CANCEL_BINDING_INVALID');
+                return;
+              }
+              const cancelIncoming = '/var/lib/codex-review-bridge/cancel-incoming';
+              const cancelAcks = '/var/lib/codex-review-bridge/cancel-acks';
+              const sequence = 1;
+              const command = {
+                schema_version: '2.0', request_id: requestId, cancel_sequence: sequence,
+                reason: 'expired', created_at: new Date().toISOString(),
+                subject_digest: digest, lease_generation: 1, attempt_number: attempt,
+              };
+              const target = path.join(cancelIncoming, `${requestId}.${sequence}.json`);
+              const temporary = path.join(cancelIncoming, `.${requestId}.${sequence}.${process.pid}.tmp`);
+              fs.writeFileSync(temporary, `${JSON.stringify(command)}\n`, { flag: 'wx', mode: 0o600 });
+              const temporaryFd = fs.openSync(temporary, 'r');
+              try { fs.fsyncSync(temporaryFd); } finally { fs.closeSync(temporaryFd); }
+              try { fs.linkSync(temporary, target); } catch (error) {
+                if (error.code !== 'EEXIST') throw error;
+              } finally {
+                fs.rmSync(temporary);
+              }
+              const cancelDirectoryFd = fs.openSync(cancelIncoming, 'r');
+              try { fs.fsyncSync(cancelDirectoryFd); } finally { fs.closeSync(cancelDirectoryFd); }
+              const ackPath = path.join(cancelAcks, `${requestId}.${sequence}.json`);
+              const deadline = Date.now() + 60 * 1000;
+              let resolution = null;
+              while (Date.now() < deadline) {
+                if (fs.existsSync(ackPath)) {
+                  resolution = JSON.parse(fs.readFileSync(ackPath, 'utf8'));
+                  break;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 1000));
+              }
+              if (!resolution || resolution.request_id !== requestId ||
+                  resolution.cancel_sequence !== sequence ||
+                  !['ACCEPTED', 'OBSOLETE_AFTER_TERMINAL'].includes(resolution.state)) {
+                core.setFailed('AI_CLI_REVIEW_CANCEL_NOT_ACCEPTED');
+                return;
+              }
+              core.info(`AI_CLI_REVIEW_CANCEL_${resolution.state}`);
+            }
+            const ready = '/var/lib/codex-review-bridge/outgoing/ready';
+            const marker = path.join(ready, `${requestId}.terminal`);
+            try {
+              const fd = fs.openSync(marker, 'wx', 0o600);
+              try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+            } catch (error) {
+              if (error.code !== 'EEXIST') throw error;
+              const metadata = fs.lstatSync(marker);
+              if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size !== 0 ||
+                  metadata.uid !== process.getuid() || (metadata.mode & 0o777) !== 0o600) {
+                throw new Error('AI_CLI_REVIEW_TERMINAL_MARKER_INVALID');
+              }
+            }
+            const directoryFd = fs.openSync(ready, 'r');
+            try { fs.fsyncSync(directoryFd); } finally { fs.closeSync(directoryFd); }
             const root = path.resolve('/var/lib/codex-review-bridge/incoming');
             const target = path.resolve(root, process.env.REQUEST_ID);
             if (!target.startsWith(`${root}${path.sep}`)) {
@@ -958,8 +1508,421 @@ jobs:
             }
             fs.rmSync(target, { recursive: true, force: true });
 
-      # Retain the bounded receipt for the root-owned claim broker. It first
-      # observes that durable output to remove the private claimed snapshot,
-      # then tmpfiles/broker retention removes the receipt within one hour.
-      # Deleting it here can race that acknowledgement and leave a request
-      # eligible for duplicate processing after the next agent scan.
+  finalize-review-request:
+    name: Finalize review scheduling request
+    needs:
+      - prepare-cli-review
+      - await-cli-review
+    if: always()
+    # Keep this base-owned API-only cleanup independent of review compute.
+    # Require the trusted control-plane pool without a hosted fallback.
+    runs-on: [self-hosted, Linux, X64, ci-control-plane, trusted-api-only]
+    timeout-minutes: 3
+    steps:
+      - name: End matching non-gating request contract
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          PR_NUMBER: ${{ needs.prepare-cli-review.outputs.pr_number || inputs.pr_number }}
+          HEAD_SHA: ${{ needs.prepare-cli-review.outputs.head_sha }}
+          MERGE_SHA: ${{ needs.prepare-cli-review.outputs.merge_sha }}
+          MERGE_TREE_SHA: ${{ needs.prepare-cli-review.outputs.merge_tree_sha }}
+          MERGE_BASE_SHA: ${{ needs.prepare-cli-review.outputs.merge_base_sha }}
+          HEAD_CHECK_RUN_ID: ${{ needs.prepare-cli-review.outputs.head_check_run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REQUEST_GENERATION: ${{ inputs.request_generation }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+          REQUIRED_LABEL: ${{ inputs.required_label }}
+          PREPARE_RESULT: ${{ needs.prepare-cli-review.result }}
+          RECEIPT_RESULT: ${{ needs.await-cli-review.outputs.receipt_step_outcome || needs.await-cli-review.result }}
+        with:
+          retries: 3
+          retry-exempt-status-codes: 400,401,403,404,422
+          script: |
+            const requestedPrNumber = Number(process.env.PR_NUMBER);
+            const eventPrNumber = Number(context.payload.pull_request?.number || 0);
+            const prNumber = requestedPrNumber > 0 ? requestedPrNumber : eventPrNumber;
+            if (!Number.isInteger(prNumber) || prNumber < 1) {
+              core.setFailed('AI_REVIEW_REQUEST_FINALIZE_PR_CONTEXT_REQUIRED');
+              return;
+            }
+            // pull_request_target carries an event snapshot. Re-read the live
+            // PR before every state projection so a delayed labeled/unlabeled
+            // event cannot authorize a stale head or resurrect a revoked PASS.
+            const pr = (await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: prNumber,
+            })).data;
+            const protectedBaseRef = await github.rest.git.getRef({
+              ...context.repo, ref: `heads/${process.env.BASE_BRANCH || 'main'}`,
+            });
+            const protectedBaseSha = protectedBaseRef.data.object?.sha?.toLowerCase();
+            if (!/^[0-9a-f]{40}$/.test(protectedBaseSha || '')) {
+              core.setFailed('AI_REVIEW_REQUEST_FINALIZE_BASE_INVALID');
+              return;
+            }
+            const headSha = (process.env.HEAD_SHA || pr.head.sha || '').toLowerCase();
+            if (!/^[0-9a-f]{40}$/.test(headSha)) {
+              core.setFailed('AI_REVIEW_REQUEST_FINALIZE_HEAD_INVALID');
+              return;
+            }
+            const runAttempt = Number(process.env.RUN_ATTEMPT || '1');
+            if (!Number.isInteger(runAttempt) || runAttempt < 1) {
+              core.setFailed('AI_REVIEW_REQUEST_FINALIZE_ATTEMPT_INVALID');
+              return;
+            }
+            const attemptGeneration = `${context.runId}:${runAttempt}`;
+            const requestPrefix = `ai-review-request:${pr.number}:${headSha}:`;
+            const suppliedGeneration = process.env.REQUEST_GENERATION || '';
+            if (suppliedGeneration && !/^\d+(?::[1-9]\d*)?$/.test(suppliedGeneration)) {
+              core.setFailed('AI_REVIEW_REQUEST_FINALIZE_GENERATION_INVALID');
+              return;
+            }
+            const externalIds = new Set(
+              [suppliedGeneration, attemptGeneration, String(context.runId)]
+                .filter(Boolean)
+                .map((generation) => `${requestPrefix}${generation}`),
+            );
+            const checks = await github.paginate(
+              github.rest.checks.listForRef,
+              { ...context.repo, ref: headSha, per_page: 100, filter: 'all' },
+            );
+            const parseCheckOutput = (check) => {
+              const text = check?.output?.text || '';
+              if (typeof text !== 'string' || text.length === 0 || text.length > 65_535) return null;
+              const fenced = text.match(/^```json\s*\n([\s\S]*?)\n```\s*$/);
+              try {
+                const parsed = JSON.parse(fenced ? fenced[1] : text);
+                return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+                  ? parsed
+                  : null;
+              } catch {
+                return null;
+              }
+            };
+            const parseRequestGeneration = (check) => {
+              const suffix = check.external_id?.startsWith(requestPrefix)
+                ? check.external_id.slice(requestPrefix.length)
+                : '';
+              const match = suffix.match(/^(\d+)(?::([1-9]\d*))?$/);
+              if (!match) return null;
+              return { runId: BigInt(match[1]), attempt: Number(match[2] || '1') };
+            };
+            const compareGeneration = (left, right) =>
+              left.runId < right.runId ? -1
+                : left.runId > right.runId ? 1
+                  : left.attempt - right.attempt;
+            const requestOutputMatches = (check) => {
+              const output = parseCheckOutput(check);
+              if (!output) return false;
+              if (output.schema === 'ai-review-request/v1') {
+                return output.repository === `${context.repo.owner}/${context.repo.repo}` &&
+                  Number(output.pr_number) === pr.number &&
+                  output.head_sha?.toLowerCase() === headSha;
+              }
+              if (output.schema === 'ai-review-lifecycle/v2') {
+                return output.repository === `${context.repo.owner}/${context.repo.repo}` &&
+                  Number(output.pr_number) === pr.number &&
+                  output.binding?.head_sha?.toLowerCase() === headSha;
+              }
+              return false;
+            };
+            const trustedRequestChecks = checks.filter((check) =>
+              check.name === 'ai-review/request' &&
+              check.head_sha?.toLowerCase() === headSha &&
+              check.app?.slug === 'github-actions' &&
+              parseRequestGeneration(check) &&
+              requestOutputMatches(check),
+            );
+            const matching = trustedRequestChecks.filter((check) => externalIds.has(check.external_id));
+            if (matching.length === 0) {
+              // Older callers do not publish the optional scheduling Check.
+              // Keep this pin backward-compatible while callers migrate.
+              core.notice('AI_REVIEW_REQUEST_FINALIZE_NOT_PUBLISHED');
+              return;
+            }
+            if (matching.length !== 1) {
+              core.setFailed('AI_REVIEW_REQUEST_FINALIZE_IDENTITY_AMBIGUOUS');
+              return;
+            }
+            const requestCheck = matching[0];
+            if (requestCheck.status === 'completed' && requestCheck.conclusion !== 'neutral') {
+              core.notice('AI_REVIEW_REQUEST_FINALIZE_ALREADY_TERMINAL');
+              return;
+            }
+            const parseCheckId = (value) => {
+              const parsed = Number(value || '0');
+              return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+            };
+            const headCheckId = parseCheckId(process.env.HEAD_CHECK_RUN_ID);
+            const mergeSha = (process.env.MERGE_SHA || '').toLowerCase();
+            const mergeTreeSha = (process.env.MERGE_TREE_SHA || '').toLowerCase();
+            const mergeBaseSha = (process.env.MERGE_BASE_SHA || '').toLowerCase();
+            const prepareResult = process.env.PREPARE_RESULT;
+            const receiptResult = process.env.RECEIPT_RESULT;
+            let phase = 'UNAVAILABLE';
+            let reasonCode = receiptResult === 'cancelled'
+              ? 'workflow_cancelled'
+              : prepareResult !== 'success'
+                ? 'gate_unreachable'
+                : 'lifecycle_abandoned';
+            let outcome = 'UNAVAILABLE';
+            let nextAction = 'restore_service';
+            let policyDigest = null;
+            if (headCheckId && /^[0-9a-f]{40}$/.test(mergeSha) && /^[0-9a-f]{40}$/.test(mergeTreeSha)) {
+              const headReceipt = await github.rest.checks.get({
+                ...context.repo, check_run_id: headCheckId,
+              });
+              const headData = headReceipt.data;
+              const headOutput = parseCheckOutput(headData);
+              const terminalReceipt =
+                headData.name === 'ai-review/receipt' &&
+                headData.app?.slug === 'github-actions' &&
+                headData.status === 'completed' &&
+                headData.head_sha?.toLowerCase() === headSha;
+              const trustedBinding = headOutput?.trusted_binding;
+              const receiptBinding = terminalReceipt &&
+                headOutput?.head_sha?.toLowerCase() === headSha &&
+                headOutput?.merge_sha?.toLowerCase() === mergeSha &&
+                headOutput?.base_sha?.toLowerCase() === protectedBaseSha &&
+                headOutput?.merge_base_sha?.toLowerCase() === mergeBaseSha &&
+                Number(headOutput?.pr_number) === pr.number &&
+                trustedBinding?.schema === 'ai-review-head-binding/v1' &&
+                trustedBinding?.repository === `${context.repo.owner}/${context.repo.repo}` &&
+                Number(trustedBinding?.pr_number) === pr.number &&
+                trustedBinding?.base_sha?.toLowerCase() === protectedBaseSha &&
+                trustedBinding?.head_sha?.toLowerCase() === headSha &&
+                trustedBinding?.reviewed_merge_sha?.toLowerCase() === mergeSha &&
+                trustedBinding?.merge_tree_sha?.toLowerCase() === mergeTreeSha &&
+                trustedBinding?.policy_digest === (headOutput?.policy_digest || null) &&
+                trustedBinding?.request_generation === process.env.REQUEST_GENERATION;
+              const generationStartedAt = headData.external_id?.match(
+                new RegExp(`^ai-cli-review:${pr.number}:${headSha}:run:${context.runId}:(\\d{13})$`),
+              )?.[1];
+              const receiptGenerationBinding = Boolean(generationStartedAt);
+              let liveMergeSha = null;
+              let liveMergeTreeSha = null;
+              try {
+                liveMergeSha = (await github.rest.git.getRef({
+                  ...context.repo,
+                  ref: `pull/${pr.number}/merge`,
+                })).data.object?.sha?.toLowerCase() || null;
+                const liveMerge = await github.rest.repos.getCommit({ ...context.repo, ref: liveMergeSha });
+                const parents = (liveMerge.data.parents || []).map((parent) => parent.sha?.toLowerCase());
+                liveMergeTreeSha = parents.length === 2 &&
+                  parents[0] === protectedBaseSha && parents[1] === headSha
+                  ? liveMerge.data.commit?.tree?.sha?.toLowerCase() || null
+                  : null;
+              } catch {
+                liveMergeSha = null;
+                liveMergeTreeSha = null;
+              }
+              const newestReceipt = (candidates) => candidates
+                .filter((check) => check.name === 'ai-review/receipt')
+                .sort((left, right) => Number(right.id || 0) - Number(left.id || 0))[0] || null;
+              const newestRequest = trustedRequestChecks
+                .sort((left, right) => Number(right.id || 0) - Number(left.id || 0))[0] || null;
+              const liveScope =
+                pr.state === 'open' &&
+                pr.draft === false &&
+                pr.base.ref === (process.env.BASE_BRANCH || 'main') &&
+                pr.base.sha?.toLowerCase() === protectedBaseSha &&
+                protectedBaseSha === headOutput?.base_sha?.toLowerCase() &&
+                pr.head.sha?.toLowerCase() === headSha &&
+                pr.head.repo?.full_name === `${context.repo.owner}/${context.repo.repo}` &&
+                (pr.labels || []).some((label) => label.name === (process.env.REQUIRED_LABEL || 'ready-for-final-review')) &&
+                liveMergeTreeSha === mergeTreeSha;
+              const approvalFence =
+                liveScope &&
+                receiptBinding &&
+                receiptGenerationBinding &&
+                newestReceipt(checks)?.id === headData.id &&
+                newestRequest?.id === requestCheck.id;
+              if (
+                approvalFence &&
+                headData.conclusion === 'success' &&
+                headOutput?.status === 'completed' &&
+                (headOutput?.decision === 'PASS' || headOutput?.decision === 'BLOCK')
+              ) {
+                // A success conclusion with a BLOCK decision means every
+                // reported finding fell into the deferred tier: the gate is
+                // satisfied and the findings remain in the exact-head receipt.
+                phase = 'APPROVED';
+                reasonCode = headOutput?.decision === 'BLOCK'
+                  ? 'review_approved_deferred_findings'
+                  : 'review_approved';
+                outcome = 'PASS';
+                nextAction = 'none';
+              } else if (receiptBinding && headOutput?.decision === 'BLOCK') {
+                phase = 'BLOCKED';
+                reasonCode = 'review_blocked';
+                outcome = 'BLOCK';
+                nextAction = 'inspect_findings';
+              } else if (terminalReceipt && headOutput?.status === 'unavailable') {
+                reasonCode = 'review_unavailable';
+              } else if (
+                receiptBinding &&
+                (headOutput?.decision === 'INCONCLUSIVE' || headOutput?.decision === 'PASS')
+              ) {
+                phase = 'INCONCLUSIVE';
+                reasonCode = 'review_inconclusive';
+                outcome = 'INCONCLUSIVE';
+                nextAction = 'investigate_inconclusive';
+              }
+              const candidatePolicyDigest = headOutput?.policy_digest;
+              if (
+                receiptBinding &&
+                typeof candidatePolicyDigest === 'string' &&
+                /^[0-9a-f]{64}$/.test(candidatePolicyDigest)
+              ) {
+                policyDigest = candidatePolicyDigest;
+              }
+              if (phase === 'APPROVED') {
+                const currentGeneration = parseRequestGeneration(requestCheck);
+                const legacyRequests = trustedRequestChecks
+                  .filter((check) => {
+                    const generation = parseRequestGeneration(check);
+                    return check.id !== requestCheck.id &&
+                      check.status === 'completed' &&
+                      check.conclusion === 'neutral' &&
+                      generation && currentGeneration &&
+                      compareGeneration(generation, currentGeneration) < 0;
+                  })
+                  .sort((left, right) => Number(left.id || 0) - Number(right.id || 0));
+                for (const check of legacyRequests) {
+                  await github.rest.checks.update({
+                    ...context.repo,
+                    check_run_id: check.id,
+                    status: 'completed',
+                    conclusion: 'success',
+                    completed_at: new Date().toISOString(),
+                  });
+                  const readback = (await github.rest.checks.get({
+                    ...context.repo,
+                    check_run_id: check.id,
+                  })).data;
+                  if (readback.status !== 'completed' || readback.conclusion !== 'success') {
+                    core.setFailed('AI_REVIEW_REQUEST_RECONCILE_READBACK_MISMATCH');
+                    return;
+                  }
+                }
+
+                // The current Request remains neutral/in-progress while old
+                // generations are repaired. Re-read every authorization fence
+                // before the final write that can make the aggregate green.
+                const [freshPrResponse, freshHeadReceipt, freshMergeRef, freshBaseRef] = await Promise.all([
+                  github.rest.pulls.get({ ...context.repo, pull_number: pr.number }),
+                  github.rest.checks.get({ ...context.repo, check_run_id: headData.id }),
+                  github.rest.git.getRef({ ...context.repo, ref: `pull/${pr.number}/merge` }),
+                  github.rest.git.getRef({ ...context.repo, ref: `heads/${process.env.BASE_BRANCH || 'main'}` }),
+                ]);
+                const freshHeadChecks = await github.paginate(
+                  github.rest.checks.listForRef,
+                  { ...context.repo, ref: headSha, per_page: 100, filter: 'all' },
+                );
+                const freshPr = freshPrResponse.data;
+                const freshHeadData = freshHeadReceipt.data;
+                const freshMergeSha = freshMergeRef.data.object?.sha?.toLowerCase();
+                const freshMergeCommit = await github.rest.repos.getCommit({
+                  ...context.repo, ref: freshMergeSha,
+                });
+                const freshMergeParents = (freshMergeCommit.data.parents || [])
+                  .map((parent) => parent.sha?.toLowerCase());
+                const freshMergeTree = freshMergeCommit.data.commit?.tree?.sha?.toLowerCase();
+                const freshRequestChecks = freshHeadChecks.filter((check) =>
+                  check.name === 'ai-review/request' &&
+                  check.head_sha?.toLowerCase() === headSha &&
+                  check.app?.slug === 'github-actions' &&
+                  parseRequestGeneration(check) &&
+                  requestOutputMatches(check),
+                );
+                const freshNewestRequest = freshRequestChecks
+                  .sort((left, right) => Number(right.id || 0) - Number(left.id || 0))[0] || null;
+                const freshScope =
+                  freshPr.state === 'open' &&
+                  freshPr.draft === false &&
+                  freshPr.base.ref === (process.env.BASE_BRANCH || 'main') &&
+                  freshPr.base.sha?.toLowerCase() === protectedBaseSha &&
+                  freshBaseRef.data.object?.sha?.toLowerCase() === protectedBaseSha &&
+                  freshPr.head.sha?.toLowerCase() === headSha &&
+                  freshPr.head.repo?.full_name === `${context.repo.owner}/${context.repo.repo}` &&
+                  (freshPr.labels || []).some((label) => label.name === (process.env.REQUIRED_LABEL || 'ready-for-final-review')) &&
+                  freshMergeTree === mergeTreeSha &&
+                  freshMergeParents.length === 2 &&
+                  freshMergeParents[0] === protectedBaseSha && freshMergeParents[1] === headSha;
+                const freshReceipt =
+                  freshHeadData.status === 'completed' &&
+                  freshHeadData.conclusion === 'success' &&
+                  freshHeadData.external_id === headData.external_id &&
+                  JSON.stringify(parseCheckOutput(freshHeadData)) === JSON.stringify(headOutput) &&
+                  newestReceipt(freshHeadChecks)?.id === headData.id &&
+                  freshNewestRequest?.id === requestCheck.id;
+                if (!freshScope || !freshReceipt) {
+                  core.setFailed('AI_REVIEW_REQUEST_RECONCILE_FENCE_CHANGED');
+                  return;
+                }
+              }
+            }
+            const now = new Date().toISOString();
+            // This remains a non-gating scheduling record: ai-review/receipt
+            // is still the only review verdict.  GitHub nevertheless folds
+            // every Check conclusion into mergeStateStatus.  A neutral
+            // terminal Request therefore leaves an otherwise fully-passing
+            // pull request UNSTABLE.  Mark only a verified APPROVED lifecycle
+            // as successful; every non-approved terminal outcome stays
+            // neutral and its Receipt remains fail-closed.
+            const schedulingConclusion = phase === 'APPROVED' ? 'success' : 'neutral';
+            const request = {
+              schema: 'ai-review-lifecycle/v2',
+              lifecycle_id: `${context.repo.owner}/${context.repo.repo}:${pr.number}:${headSha}`,
+              phase,
+              reason_code: reasonCode,
+              repository: `${context.repo.owner}/${context.repo.repo}`,
+              pr_number: pr.number,
+              binding: {
+                base_sha: protectedBaseSha,
+                head_sha: headSha,
+                merge_base_sha: /^[0-9a-f]{40}$/.test(mergeBaseSha) ? mergeBaseSha : null,
+                merge_preview_sha: /^[0-9a-f]{40}$/.test(mergeSha) ? mergeSha : null,
+                policy_digest: policyDigest,
+              },
+              timing: {
+                phase_started_at: now,
+                deadline_at: null,
+                request_wait_started_at: null,
+                request_wait_age_seconds: null,
+              },
+              terminal: true,
+              outcome,
+              next_action: {
+                code: nextAction,
+                summary: phase === 'APPROVED'
+                  ? 'The exact-head receipt was published; continue with the remaining merge gates.'
+                  : phase === 'BLOCKED'
+                    ? 'Inspect and resolve the blocking review findings before requesting a new review.'
+                    : phase === 'INCONCLUSIVE'
+                      ? 'Investigate the inconclusive review evidence and request a fresh review.'
+                      : 'Restore the trusted review gate, then request a fresh exact-head review.',
+              },
+            };
+            if (requestCheck.status === 'completed' && phase !== 'APPROVED') {
+              core.notice('AI_REVIEW_REQUEST_FINALIZE_ALREADY_TERMINAL');
+              return;
+            }
+            await github.rest.checks.update({
+              ...context.repo,
+              check_run_id: requestCheck.id,
+              status: 'completed',
+              conclusion: schedulingConclusion,
+              completed_at: now,
+              output: {
+                title: phase === 'APPROVED'
+                  ? 'AI review request completed'
+                  : phase === 'BLOCKED'
+                    ? 'AI review completed with blocking findings'
+                    : phase === 'INCONCLUSIVE'
+                      ? 'AI review completed without a conclusive decision'
+                      : 'AI review lifecycle unavailable',
+                summary: 'The scheduling contract is terminal. ai-review/receipt remains the sole review verdict.',
+                text: `\`\`\`json\n${JSON.stringify(request)}\n\`\`\``,
+              },
+            });
