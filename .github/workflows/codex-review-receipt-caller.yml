@@ -6,6 +6,7 @@ on:
       - labeled
       - unlabeled
       - reopened
+      - closed
       - synchronize
       - converted_to_draft
   workflow_dispatch:
@@ -116,6 +117,7 @@ jobs:
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       (
+        github.event.action == 'closed' ||
         github.event.action == 'reopened' ||
         github.event.action == 'synchronize' ||
         github.event.action == 'converted_to_draft' ||
@@ -218,10 +220,38 @@ jobs:
             }
             core.setOutput('label_removed', labelRemoved ? 'true' : 'false');
 
+      - name: End invalidated review scheduling requests
+        if: (always()) && steps.invalidation-current.outputs.current == 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const refs = new Set([pr.head.sha, context.payload.before].filter(
+              (sha) => /^[0-9a-f]{40}$/i.test(sha || ''),
+            ));
+            for (const sha of refs) {
+              const checks = await github.paginate(github.rest.checks.listForRef,
+                { owner, repo, ref: sha, per_page: 100, filter: 'all' });
+              for (const check of checks) {
+                if (check.app?.id !== 15368 || check.name !== 'ai-review/request' ||
+                    check.status === 'completed' || check.head_sha !== sha ||
+                    !check.external_id?.startsWith(`ai-review-request:${pr.number}:${sha}:`)) continue;
+                await github.rest.checks.update({
+                  owner, repo, check_run_id: check.id, status: 'completed', conclusion: 'neutral',
+                  completed_at: new Date().toISOString(),
+                  output: {
+                    title: 'Review scheduling request ended',
+                    summary: `The ${context.payload.action} event invalidated this scheduling request. This is not a review verdict.`,
+                  },
+                });
+              }
+            }
+
       # Keep receipt publication on the short-lived workflow token. The
       # dedicated token above never receives Checks permission or merge power.
       - name: Publish final-head review requirement
-        if: (always()) && steps.invalidation-current.outputs.current == 'true'
+        if: (always()) && steps.invalidation-current.outputs.current == 'true' && github.event.pull_request.merged != true
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
           LABEL_REMOVED: ${{ steps.remove-stale-label.outputs.label_removed }}
@@ -233,7 +263,7 @@ jobs:
             const upsertInvalidation = async (sha, externalIdPrefix) => {
               const existingChecks = await github.paginate(
                 github.rest.checks.listForRef,
-                { owner, repo, ref: sha, per_page: 100 },
+                { owner, repo, ref: sha, per_page: 100, filter: 'all' },
               );
               const existing = existingChecks.find((check) =>
                 check.name === 'ai-review/receipt' &&
@@ -243,7 +273,9 @@ jobs:
               const parameters = {
                 owner,
                 repo,
-                status: 'in_progress',
+                status: 'completed',
+                conclusion: 'failure',
+                completed_at: new Date().toISOString(),
                 output: {
                   title: 'Final-head AI review required',
                   summary: process.env.LABEL_REMOVED === 'true'
@@ -269,6 +301,8 @@ jobs:
               pr.head.sha,
               `ai-review-invalidated:${pr.number}:${pr.head.sha}`,
             );
+            // Closed, unmerged PRs no longer have a reliable merge ref.
+            if (pr.state === 'closed') return;
             try {
               const mergeSha = (await github.rest.git.getRef({
                 owner,
