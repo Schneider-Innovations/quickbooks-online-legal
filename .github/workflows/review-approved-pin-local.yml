@@ -27,32 +27,149 @@ jobs:
       # protected-base local mirrors are admitted only by exact Git blob ID.
       # Bootstrap preserves older protected-base blobs until the final lifecycle PR proves the anchored parser.
       APPROVED_LOCAL_WORKFLOW_BLOBS: |
-        Schneider-Innovations/amazon-store-outpost-legal=b3fa292f8828abfa68bc87e3fc6cd13c2f2bbbd8
-        Schneider-Innovations/amazon-store-outpost-legal=e857954a46e6f26c4ebccafb461efa19b47ffb63
-        Schneider-Innovations/amazon-store-outpost-legal=3dd7abf0c29d65133e5a1d3349119ad58899cde9
-        Schneider-Innovations/amazon-store-outpost-legal=0b116d39ad109ab746fd60ce2c8118ff74d299f7
-        Schneider-Innovations/quickbooks-online-legal=b3fa292f8828abfa68bc87e3fc6cd13c2f2bbbd8
-        Schneider-Innovations/quickbooks-online-legal=e857954a46e6f26c4ebccafb461efa19b47ffb63
-        Schneider-Innovations/quickbooks-online-legal=3dd7abf0c29d65133e5a1d3349119ad58899cde9
-        Schneider-Innovations/quickbooks-online-legal=0b116d39ad109ab746fd60ce2c8118ff74d299f7
-        Schneider-Innovations/amazon-store-outpost-legal=87f3727d62af63e2fb43dc543892ddab903a93c1
-        Schneider-Innovations/amazon-store-outpost-legal=de3fa67bd3bb0d8bea343c08f0bfefec42e60242
+        Schneider-Innovations/amazon-store-outpost-legal=030b2c689195c2a092b3f1e8557d7b8b06adea93
+        Schneider-Innovations/amazon-store-outpost-legal=19bb5007763f597685f59b7b186900fa4a6283c8
+        Schneider-Innovations/amazon-store-outpost-legal=35d2dec59de2c7d8766d69cadbabe27a4d3223c6
+        Schneider-Innovations/amazon-store-outpost-legal=57e6c6b555a1c43798ec3a080d553ce8545c9335
         Schneider-Innovations/amazon-store-outpost-legal=7060f82d9117599ca851415122ee0fdff4f53a26
-        Schneider-Innovations/quickbooks-online-legal=87f3727d62af63e2fb43dc543892ddab903a93c1
-        Schneider-Innovations/quickbooks-online-legal=de3fa67bd3bb0d8bea343c08f0bfefec42e60242
-        Schneider-Innovations/quickbooks-online-legal=7060f82d9117599ca851415122ee0fdff4f53a26
+        Schneider-Innovations/amazon-store-outpost-legal=8492692a86352fdb4076a9365e0e96d157864865
+        Schneider-Innovations/amazon-store-outpost-legal=864e8aa6de1e0570c350c4368818255488dd3c20
+        Schneider-Innovations/amazon-store-outpost-legal=87f3727d62af63e2fb43dc543892ddab903a93c1
+        Schneider-Innovations/amazon-store-outpost-legal=88a33cbf3369feca70e6a7ac00505f673e5c299d
+        Schneider-Innovations/amazon-store-outpost-legal=8c062413fa31738f8c7af905c90c203efb5da888
+        Schneider-Innovations/amazon-store-outpost-legal=9778d3880cec60f380c335a6595f50a014cea6f2
+        Schneider-Innovations/amazon-store-outpost-legal=9b189132da47c3fc82f96fba6a1d8a0580091344
+        Schneider-Innovations/amazon-store-outpost-legal=ab0a6642d94ae0dcd6d62131148396531cca3eff
+        Schneider-Innovations/amazon-store-outpost-legal=b0a7baa85894f3be1550a53132d336c2f466056d
+        Schneider-Innovations/amazon-store-outpost-legal=c7a03f81efe21968b8799171e0c4fe16d7eceddd
+        Schneider-Innovations/amazon-store-outpost-legal=c7e289e07d78e3819e4feedc05995cfc51a058bf
         Schneider-Innovations/amazon-store-outpost-legal=cb9fbfe11578df5193bee29ae4efa8091c8f7966
+        Schneider-Innovations/amazon-store-outpost-legal=ce47145c37ad4042b46c901a78f3ed574446ac95
+        Schneider-Innovations/amazon-store-outpost-legal=d00267998797665b20777d83a4c33ef070cd9302
+        Schneider-Innovations/amazon-store-outpost-legal=d9e616e818c1cd72f7701a3dee51332292e1bbc8
+        Schneider-Innovations/amazon-store-outpost-legal=dc44193419c8731d1137583fe33fcb4789e522ed
+        Schneider-Innovations/amazon-store-outpost-legal=de3fa67bd3bb0d8bea343c08f0bfefec42e60242
+        Schneider-Innovations/amazon-store-outpost-legal=df69d2ce8173904499df8d2b3f949e2de461e47c
+        Schneider-Innovations/amazon-store-outpost-legal=e437bbfb74cdf35e94dcc10b0283408f30e4a125
+        Schneider-Innovations/amazon-store-outpost-legal=f4c14b50ca46ae6c7d562ab4ea277c101d63a7a2
+        Schneider-Innovations/amazon-store-outpost-legal=ffcf5c3a74924e6bcd1eaad568a1c222f67dea80
+        Schneider-Innovations/quickbooks-online-legal=030b2c689195c2a092b3f1e8557d7b8b06adea93
+        Schneider-Innovations/quickbooks-online-legal=19bb5007763f597685f59b7b186900fa4a6283c8
+        Schneider-Innovations/quickbooks-online-legal=35d2dec59de2c7d8766d69cadbabe27a4d3223c6
+        Schneider-Innovations/quickbooks-online-legal=57e6c6b555a1c43798ec3a080d553ce8545c9335
+        Schneider-Innovations/quickbooks-online-legal=7060f82d9117599ca851415122ee0fdff4f53a26
+        Schneider-Innovations/quickbooks-online-legal=8492692a86352fdb4076a9365e0e96d157864865
+        Schneider-Innovations/quickbooks-online-legal=864e8aa6de1e0570c350c4368818255488dd3c20
+        Schneider-Innovations/quickbooks-online-legal=87f3727d62af63e2fb43dc543892ddab903a93c1
+        Schneider-Innovations/quickbooks-online-legal=88a33cbf3369feca70e6a7ac00505f673e5c299d
+        Schneider-Innovations/quickbooks-online-legal=8c062413fa31738f8c7af905c90c203efb5da888
+        Schneider-Innovations/quickbooks-online-legal=9778d3880cec60f380c335a6595f50a014cea6f2
+        Schneider-Innovations/quickbooks-online-legal=9b189132da47c3fc82f96fba6a1d8a0580091344
+        Schneider-Innovations/quickbooks-online-legal=ab0a6642d94ae0dcd6d62131148396531cca3eff
+        Schneider-Innovations/quickbooks-online-legal=b0a7baa85894f3be1550a53132d336c2f466056d
+        Schneider-Innovations/quickbooks-online-legal=c7a03f81efe21968b8799171e0c4fe16d7eceddd
+        Schneider-Innovations/quickbooks-online-legal=c7e289e07d78e3819e4feedc05995cfc51a058bf
         Schneider-Innovations/quickbooks-online-legal=cb9fbfe11578df5193bee29ae4efa8091c8f7966
+        Schneider-Innovations/quickbooks-online-legal=ce47145c37ad4042b46c901a78f3ed574446ac95
+        Schneider-Innovations/quickbooks-online-legal=d00267998797665b20777d83a4c33ef070cd9302
+        Schneider-Innovations/quickbooks-online-legal=d9e616e818c1cd72f7701a3dee51332292e1bbc8
+        Schneider-Innovations/quickbooks-online-legal=dc44193419c8731d1137583fe33fcb4789e522ed
+        Schneider-Innovations/quickbooks-online-legal=de3fa67bd3bb0d8bea343c08f0bfefec42e60242
+        Schneider-Innovations/quickbooks-online-legal=df69d2ce8173904499df8d2b3f949e2de461e47c
+        Schneider-Innovations/quickbooks-online-legal=e437bbfb74cdf35e94dcc10b0283408f30e4a125
+        Schneider-Innovations/quickbooks-online-legal=f4c14b50ca46ae6c7d562ab4ea277c101d63a7a2
+        Schneider-Innovations/quickbooks-online-legal=ffcf5c3a74924e6bcd1eaad568a1c222f67dea80
       APPROVED_REUSABLE_REFS: |
+        0184a8e1d905b285b5357a50d08d1877edcb62de
+        04d48347aadaa4b61554e4c62f8e5d585b6c6326
+        07a91a13cd48f89f5950de7924c0a6a7ae1062bf
         0a32c354464b4289ad7c791434ac0ded5dfa00f5
-        3aed02cdf707b465184382eb301abe542b0e36ff
-        f03cfccf51847f09ba059068fd76d99c15150c8c
+        0a3fb058b978975b2a9e182a5ee82c8d84bd7b7f
+        0cd973c45e019e3ce46f5e56ef2e0b4725445332
+        0d197fb284f8126ebc19a344ff21830ca94c8b23
+        0f72e8a287f85f8431e3411b6107bccf9eab9dab
+        177b9ba82e0a2acaa65d4af1d67e16a40f6d5d1c
+        193f74454ffc9333ebfb2777652789f34ebcc95f
+        196626461c6aa5ca5aea44fd8d35984f6442aec6
+        19b3b257a9492ba622631ab5114aff451d3eb93a
+        1b60a0b86e56e60161944e64e67e63ecc8b833e6
+        1ddccb49739509cf5d8401efa740b8f08300d5a5
+        202b9d8b2f60a92d09504a9dcfbc2a70795e3d4f
+        21a1a36607591ce6670341143b70383356b0d0f3
+        28abaa3594832c674a52876761cb467e347bb150
+        2dc34bb700a106db3e7f1ca1049ff76b8ac0e3f4
+        2e017a93e2ca281dc4e4af18bd9df72ffa6e94ed
+        3021f5cc2948764c72b2c5e05f318feb7a45c6ff
         334d2b331fb2b8c9b4c3dcd2e308e6dfedaf940a
+        3aed02cdf707b465184382eb301abe542b0e36ff
+        3bc2a619672e7aaef7f3c8304ee576da2e9d460e
+        417e0420996facfb14c3b22e303a2228e581b13e
+        42df7c37110e4b9b987977d8e6908d50aa0c4d5a
+        4687ad16927eb4b670c521d5c98379b4e2abb62d
+        46a271282de2e4e389ef153017602f3b357cd524
+        47f549dcf4140b7452d6ed473c2c6a31105e084b
+        4a70a608e4a4bd7b4b4c518c6ff9212ec6d207c3
+        4d73fa5800856b4bec8d1cc4f9a83155c52d6b59
+        4df39027d2606d59d33db802c81ad1c980e64894
+        4ea87cd0ca1fe11f44f644e02a12a32721d48de6
+        53ca8cd61d288a278c558f3fb7a2acd7aa8b5d24
+        55fea97b740997bb5d4f088a326e2f611709eca9
+        5816edefd1dbbf2cb49568195cbb6ee3c7d1eff8
+        5b63eb524c2361d0f9c18fb7ddc8f0ed9888d02e
+        5bd74c573cbde96401a1de7c970ce94a1bc168b9
+        67ed0c8a463469c0887cf64f9728bbbd328ba58f
+        693131c24d455a4c376c243d8679fca4baef5d15
+        6a6bd1aabeebf29ce9e5e35b8358ad201d5874f4
+        6c991b6e5f5776bf48e6fb9f8fd5d87ef453b726
+        7851dfd205ccc8be0a082150e172c52c158e6361
+        7a1c14251009673deecf9a3c89e20259311d939d
+        7cb5e4755f9272d5b6055972d0e59e9c98b72f11
+        839cc6be69ed517d3b1cf18938215354595a3c24
+        84453d22d3228aeb0d68357be65720349e424d1c
         8e97b25ed86e6b6d7aaf07bd603b51726c38e3c4
+        8fca804768ec778aa7d05db36b943926569dab49
+        939067620ba4397bfb156ba6838ac7b5bf051a8f
         945fc83f4ff11bab8f0c9992e7744011243eeb29
+        9747d1b070ea03646c051244c66f2c35d6ce8464
         9956187ca1d111b7de67d7e7949dafa15f76dbb3
+        9a4879d0ce40d9cbd8a9c2b5daad045d70d371b8
+        9a6e08d661b3d613505888504774f379da7f5969
+        9c1becbed9d687007e438af3b444750f10b7d19c
         a248ee58c2ad9c356eac36334879e804c9e3b4d9
+        a30dbbbd2938b77280f4df66d3f90b23064ad137
+        a5f2eacaf3c42ba7d18baaafb9a2217f38f99e9a
+        a68fdfe5a34e8f2eb368e6ea28a61eb587a99d08
+        a6ae3876a913a595c8b53b38764e61f1406a9659
+        a7767776973217a78fd84038125cb2a48614825e
+        a77ac16ceecae38bfb482bf72dbddb647c4f0982
+        acdd2cfcf23cfe85725b3bf50ad3eae82944b2b1
+        aec411cd6a9d73ba883b6cf54391f42a8722242a
+        b00a997e4a32e306c6037755c74e022018ab3225
+        b6b09c77d725dad63c5d6dc7ec34de3a0b031066
+        b73a0959d28ce8d38c35afe1370038c60c663e4e
         b9a1752a4a5cdd1dd6c74ef00efbe101f0dfc369
+        bb930195a7aa81589b495b806be737dbd1cc2157
+        bccbcfe63601db0c3acbb677eb4889e539b41ebd
+        c05f903b750a5a31b08b8a28488e1a06f1e26948
+        c2ad3e4480ac0285da090928edc49ca63e7a869c
+        c928c2d50c4827daa8dbe3909a23d7d3e4f28860
+        cde1fad4dbb47a4c2f80acdc65ae2c4ffd80ab57
+        cffd40048cfe82ba2af4ac2376335ac8e92b3d63
+        d3d7da68ec474fa35fb6120b383a184220a6f513
+        d45e75661e453c52e0c85e2a44bb2aaf450ffbc8
+        d8c941e5908e8e1130f6d61c603cb9f76db9340e
+        db82d8df862739da89d22876c69faae334c6fe14
+        e04312d15ee71951abebfd28a0b4eee49f5a99f2
+        e2d39551b39f8886de4066481f5c74b8cbb94d24
+        eb87185547f2787090c2bf91a977ae4cab532537
+        ef5d279723852aad39963cbe9ad478eb21722f52
+        f03cfccf51847f09ba059068fd76d99c15150c8c
+        f05bbca59b96ece2aa4b08f6efa6cb69af1650c2
+        f14244b2b93269a53d16295912d60c2f9fc4d65d
+        f9de28082c39ac7e0b7fec6006f364798163b071
+        fbabef07bcdf88d15a605325b53c73e7320bbe04
+        fc65d7fc7f1d0403ad22e011340e5b8668125917
+        fed645783ad23c71e59b8a012f97b01ee319ed54
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Verify proposed caller uses a centrally approved revision
