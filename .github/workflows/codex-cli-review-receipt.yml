@@ -615,7 +615,8 @@ jobs:
               }
               const activeDeadline = processingDeadline ?? queueDeadline;
               if (now >= activeDeadline) break;
-              await new Promise((resolve) => setTimeout(resolve, Math.min(10 * 1000, activeDeadline - now)));
+              // Local filesystem checks only; no GitHub API requests in this loop.
+              await new Promise((resolve) => setTimeout(resolve, Math.min(1000, activeDeadline - now)));
             }
             const expectedHead = process.env.HEAD_SHA;
             const expectedMerge = process.env.MERGE_SHA;
