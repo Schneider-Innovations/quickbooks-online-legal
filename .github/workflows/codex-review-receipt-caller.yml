@@ -44,71 +44,82 @@ jobs:
     outputs:
       admitted: ${{ steps.admission.outputs.admitted }}
     steps:
-    - name: Deduplicate active exact-head review requests
-      id: admission
-      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
-      env:
-        PR_NUMBER: ${{ github.event.pull_request.number || github.event.client_payload.pr_number || github.event.inputs.pr_number }}
-        REVIEW_WORKFLOW_REF: 27ccd2d9ed948b5fe0bbadb74dd70a4f4c743bd4 # pragma: allowlist secret
-      with:
-        retries: 0
-        script: |
-          // Runs only in the protected caller's short, per-PR serialized admission job.
-          // A neutral ledger entry is scheduling evidence; it is never a review verdict.
-          core.setOutput('admitted', 'false');
-          const number = Number(process.env.PR_NUMBER);
-          if (!Number.isSafeInteger(number) || number <= 0) throw new Error('ADMISSION_PR_REQUIRED');
-          const pr = (await github.rest.pulls.get({ ...context.repo, pull_number: number })).data;
-          if (pr.state !== 'open' || pr.draft || pr.base.ref !== 'main' ||
-              pr.head.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}` ||
-              !pr.labels.some(label => label.name === 'ready-for-final-review')) {
-            core.notice('ADMISSION_PR_NOT_READY');
-            return;
-          }
-          if (context.payload.pull_request && context.payload.pull_request.head.sha !== pr.head.sha) {
-            core.notice('ADMISSION_STALE_EVENT');
-            return;
-          }
-          const base = (await github.rest.repos.getBranch({ ...context.repo, branch: 'main' })).data.commit.sha;
-          const identity = { repository: `${context.repo.owner}/${context.repo.repo}`, pr: number,
-            head: pr.head.sha, base, workflow_ref: process.env.REVIEW_WORKFLOW_REF };
-          const runId = Number(context.runId);
-          const attempt = Number(process.env.GITHUB_RUN_ATTEMPT);
-          const prefix = `review-admission/1:${identity.repository}:${number}:`;
-          const listed = (await github.rest.checks.listForRef({ ...context.repo, ref: pr.head.sha,
-            check_name: 'ai-review/admission', filter: 'all', per_page: 100 })).data;
-          // Bound API use and never guess that truncated evidence means no active owner.
-          if (listed.total_count > 100) throw new Error('ADMISSION_HISTORY_LIMIT');
-          let observed = 0;
-          for (const check of listed.check_runs) {
-            if (check.app?.id !== 15368 || check.status !== 'completed' || check.conclusion !== 'neutral' ||
-                !check.external_id?.startsWith(prefix)) continue;
-            let record;
-            try { record = JSON.parse(check.output?.summary || ''); } catch { continue; }
-            if (record.schema_version !== 'review-admission/1' ||
-                !Object.entries(identity).every(([key, value]) => record[key] === value) ||
-                !Number.isSafeInteger(record.run_id) || !Number.isSafeInteger(record.run_attempt) ||
-                check.external_id !== `${prefix}${record.run_id}:${record.run_attempt}`) continue;
-            if (++observed > 20) throw new Error('ADMISSION_ACTIVE_HISTORY_LIMIT');
-            const run = (await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: record.run_id })).data;
-            if (run.path !== '.github/workflows/codex-review-receipt-caller.yml' ||
-                !['pull_request_target', 'repository_dispatch', 'workflow_dispatch'].includes(run.event) ||
-                run.run_attempt !== record.run_attempt) continue;
-            if (record.run_id === runId && record.run_attempt === attempt) {
-              core.setOutput('admitted', 'true');
+      - env:
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.client_payload.pr_number || github.event.inputs.pr_number }}
+          REVIEW_WORKFLOW_REF: 13dffb5bf45169e85a08558ea557b19ddbf1da15 # pragma: allowlist secret
+        id: admission
+        name: Deduplicate active exact-head review requests
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        with:
+          retries: 0
+          script: |
+            // Runs only in the protected caller's short, per-PR serialized admission job.
+            // A neutral ledger entry is scheduling evidence; it is never a review verdict.
+            core.setOutput('admitted', 'false');
+            const number = Number(process.env.PR_NUMBER);
+            if (!Number.isSafeInteger(number) || number <= 0) throw new Error('ADMISSION_PR_REQUIRED');
+            const pr = (await github.rest.pulls.get({ ...context.repo, pull_number: number })).data;
+            if (pr.state !== 'open' || pr.draft || pr.base.ref !== 'main' ||
+                pr.head.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}` ||
+                !pr.labels.some(label => label.name === 'ready-for-final-review')) {
+              core.notice('ADMISSION_PR_NOT_READY');
               return;
             }
-            if (run.status !== 'completed') {
-              core.notice(`ADMISSION_DUPLICATE_ACTIVE_RUN:${record.run_id}`);
+            if (context.payload.pull_request && context.payload.pull_request.head.sha !== pr.head.sha) {
+              core.notice('ADMISSION_STALE_EVENT');
               return;
             }
-          }
-          await github.rest.checks.create({ ...context.repo, name: 'ai-review/admission',
-            head_sha: pr.head.sha, status: 'completed', conclusion: 'neutral',
-            external_id: `${prefix}${runId}:${attempt}`,
-            output: { title: 'Review request admitted', summary: JSON.stringify({
-              schema_version: 'review-admission/1', ...identity, run_id: runId, run_attempt: attempt }) } });
-          core.setOutput('admitted', 'true');
+            const base = (await github.rest.repos.getBranch({ ...context.repo, branch: 'main' })).data.commit.sha;
+            const identity = { repository: `${context.repo.owner}/${context.repo.repo}`, pr: number,
+              head: pr.head.sha, base, workflow_ref: process.env.REVIEW_WORKFLOW_REF };
+            const runId = Number(context.runId);
+            const attempt = Number(process.env.GITHUB_RUN_ATTEMPT);
+            const prefix = `review-admission/1:${identity.repository}:${number}:`;
+            const listed = (await github.rest.checks.listForRef({ ...context.repo, ref: pr.head.sha,
+              check_name: 'ai-review/admission', filter: 'all', per_page: 100 })).data;
+            // Compact completed owners into a separate audit Check name. Bound each
+            // pass to the 100 fetched records; never admit from truncated active evidence.
+            // A legacy backlog makes durable progress instead of permanently exhausting
+            // a lifetime retry quota. No review verdict or receipt Check is modified.
+            let archived = 0;
+            for (const check of listed.check_runs) {
+              if (check.app?.id !== 15368 || check.status !== 'completed' || check.conclusion !== 'neutral' ||
+                  !check.external_id?.startsWith(prefix)) continue;
+              let record;
+              try { record = JSON.parse(check.output?.summary || ''); } catch { continue; }
+              if (record.schema_version !== 'review-admission/1' ||
+                  record.repository !== identity.repository || record.pr !== number || record.head !== identity.head ||
+                  !Number.isSafeInteger(record.run_id) || !Number.isSafeInteger(record.run_attempt) ||
+                  check.external_id !== `${prefix}${record.run_id}:${record.run_attempt}`) continue;
+              const sameIdentity = Object.entries(identity).every(([key, value]) => record[key] === value);
+              const run = (await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: record.run_id })).data;
+              if (run.path !== '.github/workflows/codex-review-receipt-caller.yml' ||
+                  !['pull_request_target', 'repository_dispatch', 'workflow_dispatch'].includes(run.event)) continue;
+              if (run.status === 'completed') {
+                await github.rest.checks.update({ ...context.repo, check_run_id: check.id, name: 'ai-review/admission-history' });
+                archived += 1;
+                continue;
+              }
+              if (!sameIdentity || run.run_attempt !== record.run_attempt) continue;
+              if (record.run_id === runId && record.run_attempt === attempt) {
+                core.setOutput('admitted', 'true');
+                return;
+              }
+              if (run.status !== 'completed') {
+                core.notice(`ADMISSION_DUPLICATE_ACTIVE_RUN:${record.run_id}`);
+                return;
+              }
+            }
+            if (listed.total_count > 100) {
+              core.notice(`ADMISSION_HISTORY_COMPACTED:${archived}`);
+              throw new Error('ADMISSION_HISTORY_COMPACTED_RETRY');
+            }
+            await github.rest.checks.create({ ...context.repo, name: 'ai-review/admission',
+              head_sha: pr.head.sha, status: 'completed', conclusion: 'neutral',
+              external_id: `${prefix}${runId}:${attempt}`,
+              output: { title: 'Review request admitted', summary: JSON.stringify({
+                schema_version: 'review-admission/1', ...identity, run_id: runId, run_attempt: attempt }) } });
+            core.setOutput('admitted', 'true');
     if: (github.event_name == 'pull_request_target' && github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && github.event.action == 'labeled' && github.event.label.name == 'ready-for-final-review' && github.actor == (vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231')) || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.pr_number > 0 && github.actor == (vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231'))
 
   invalidate-review:
