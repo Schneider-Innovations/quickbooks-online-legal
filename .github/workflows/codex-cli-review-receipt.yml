@@ -459,6 +459,7 @@ jobs:
           script: |
             const fs = require('fs');
             const path = require('path');
+            const crypto = require('crypto');
             // Submission can precede preparation failure or cancellation. The
             // verifier job may never start, so terminalize here as well before
             // removing input; a claimed producer can still publish afterwards.
@@ -1212,8 +1213,9 @@ jobs:
                 ? { ...checkOutput, annotations: findingAnnotations }
                 : checkOutput,
             };
+            let publishedHeadCheck;
             try {
-              await github.rest.checks.update(headCheckParameters);
+              publishedHeadCheck = (await github.rest.checks.update(headCheckParameters)).data;
             } catch (error) {
               // GitHub rejects the whole update when even one annotation line
               // cannot be resolved in the head commit. Retry exactly once
@@ -1223,10 +1225,10 @@ jobs:
                 `${projectableFindings.length} summary-only because GitHub rejected the receipt coordinates.`;
               checkOutput.summary = checkOutput.summary.replace(projectionRecord, fallbackRecord);
               core.warning('AI_CLI_REVIEW_FINDING_ANNOTATIONS_REJECTED');
-              await github.rest.checks.update({
+              publishedHeadCheck = (await github.rest.checks.update({
                 ...headCheckParameters,
                 output: checkOutput,
-              });
+              })).data;
             }
             try {
               await assertCurrentReviewBinding();
@@ -1237,6 +1239,122 @@ jobs:
                 status: 'completed', conclusion: 'failure', completed_at: new Date().toISOString(),
                 output: { title: 'Codex CLI review binding changed',
                   summary: 'Fail-closed: base, head, merge preview, or merge tree changed during publication.' },
+              });
+              throw error;
+            }
+            const archiveMarker = '/var/lib/code-review-receipt-archive/enabled.json';
+            const archiveInbox = '/var/lib/code-review-receipt-archive/inbox';
+            const archivePublishedCheck = () => {
+              if (!fs.existsSync(archiveMarker)) {
+                core.info('AI_REVIEW_CHECK_ARCHIVE_DISABLED');
+                return;
+              }
+              const activation = JSON.parse(fs.readFileSync(archiveMarker, 'utf8'));
+              if (
+                activation?.schema !== 'ai-review-check-archive-activation/v1' ||
+                !/^[0-9a-f]{40}$/.test(activation.quality_gate_sha || '') ||
+                typeof activation.activated_at !== 'string'
+              ) {
+                throw new Error('AI_REVIEW_CHECK_ARCHIVE_ACTIVATION_INVALID');
+              }
+              const selected = {
+                id: publishedHeadCheck?.id,
+                name: publishedHeadCheck?.name,
+                app: { id: publishedHeadCheck?.app?.id },
+                status: publishedHeadCheck?.status,
+                conclusion: publishedHeadCheck?.conclusion,
+                head_sha: publishedHeadCheck?.head_sha,
+                started_at: publishedHeadCheck?.started_at,
+                completed_at: publishedHeadCheck?.completed_at,
+                html_url: publishedHeadCheck?.html_url,
+                external_id: publishedHeadCheck?.external_id,
+                output: { summary: publishedHeadCheck?.output?.summary },
+              };
+              if (
+                !Number.isSafeInteger(selected.id) || selected.id <= 0 ||
+                selected.name !== 'ai-review/receipt' || selected.app.id !== 15368 ||
+                selected.status !== 'completed' ||
+                !['success', 'failure'].includes(selected.conclusion) ||
+                selected.head_sha !== expectedHead ||
+                typeof selected.completed_at !== 'string' ||
+                typeof selected.html_url !== 'string' ||
+                typeof selected.output.summary !== 'string' ||
+                selected.output.summary.length > 65535 ||
+                !new RegExp(`^ai-cli-review:${process.env.PR_NUMBER}:${expectedHead}:run:${context.runId}:[0-9]+$`)
+                  .test(selected.external_id || '')
+              ) {
+                throw new Error('AI_REVIEW_CHECK_ARCHIVE_RESPONSE_INVALID');
+              }
+              const exported = {
+                schema: 'ai-review-check-export/v1',
+                repository: `${context.repo.owner}/${context.repo.repo}`,
+                workflow_run_id: context.runId,
+                workflow_run_attempt: reviewRunAttempt,
+                recorded_at: new Date().toISOString(),
+                check_run: selected,
+              };
+              const bytes = Buffer.from(`${JSON.stringify(exported)}\n`, 'utf8');
+              if (bytes.length > 128 * 1024) {
+                throw new Error('AI_REVIEW_CHECK_ARCHIVE_EXPORT_TOO_LARGE');
+              }
+              const digest = crypto.createHash('sha256')
+                .update(`${exported.repository}:${selected.id}`)
+                .digest('hex');
+              const target = path.resolve(archiveInbox, `${digest}.json`);
+              const temporary = path.resolve(
+                archiveInbox, `.${digest}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`,
+              );
+              if (!target.startsWith(`${path.resolve(archiveInbox)}${path.sep}`) ||
+                  !temporary.startsWith(`${path.resolve(archiveInbox)}${path.sep}`)) {
+                throw new Error('AI_REVIEW_CHECK_ARCHIVE_PATH_INVALID');
+              }
+              let descriptor;
+              try {
+                descriptor = fs.openSync(temporary, 'wx', 0o600);
+                fs.writeFileSync(descriptor, bytes);
+                fs.fsyncSync(descriptor);
+                fs.closeSync(descriptor);
+                descriptor = undefined;
+                try {
+                  // link(2) is the no-overwrite publication primitive here;
+                  // rename would silently replace an existing same-id export.
+                  fs.linkSync(temporary, target);
+                  const directory = fs.openSync(archiveInbox, 'r');
+                  try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+                  fs.unlinkSync(temporary);
+                } catch (error) {
+                  if (error?.code !== 'EEXIST') throw error;
+                  const existing = fs.lstatSync(target);
+                  if (!existing.isFile() || existing.isSymbolicLink() ||
+                      existing.nlink !== 1 || (existing.mode & 0o777) !== 0o600 ||
+                      existing.uid !== process.getuid()) {
+                    throw new Error('AI_REVIEW_CHECK_ARCHIVE_EXISTING_UNSAFE');
+                  }
+                  if (!fs.readFileSync(target).equals(bytes)) {
+                    throw new Error('AI_REVIEW_CHECK_ARCHIVE_CONFLICT');
+                  }
+                  fs.unlinkSync(temporary);
+                }
+              } finally {
+                if (descriptor !== undefined) fs.closeSync(descriptor);
+                try { fs.unlinkSync(temporary); } catch (error) {
+                  if (error?.code !== 'ENOENT') throw error;
+                }
+              }
+            };
+            try {
+              archivePublishedCheck();
+            } catch (error) {
+              // A successful required Check without its durable export would
+              // create a silent reporting gap. Revoke success before failing.
+              await github.rest.checks.update({
+                ...context.repo,
+                check_run_id: Number(process.env.HEAD_CHECK_RUN_ID),
+                status: 'completed', conclusion: 'failure', completed_at: new Date().toISOString(),
+                output: {
+                  title: 'Codex CLI review receipt archive unavailable',
+                  summary: 'Fail-closed: the exact terminal receipt could not be durably archived.',
+                },
               });
               throw error;
             }
