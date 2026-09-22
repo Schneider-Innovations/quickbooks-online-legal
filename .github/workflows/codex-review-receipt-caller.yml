@@ -347,7 +347,6 @@ jobs:
     # separately allowlisted; advancing it requires a reviewed PR.
     uses: ./.github/workflows/codex-cli-review-receipt.yml
     with:
-      review_release_id: review-2026-09-21.57
       # workflow_dispatch inputs arrive as strings. Convert explicitly so the
       # reusable workflow's number input receives a JSON number, not "19".
       pr_number: ${{ github.event_name == 'workflow_dispatch' && fromJSON(inputs.pr_number) || 0 }}
