@@ -569,6 +569,7 @@ jobs:
           script: |
             const fs = require('fs');
             const path = require('path');
+            const crypto = require('crypto');
             const requestId = process.env.REQUEST_ID;
             const reviewRunAttempt = Number(process.env.REVIEW_RUN_ATTEMPT);
             if (!Number.isSafeInteger(reviewRunAttempt) || reviewRunAttempt < 1) {
