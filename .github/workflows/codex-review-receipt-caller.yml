@@ -46,7 +46,7 @@ jobs:
     steps:
       - env:
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.client_payload.pr_number || github.event.inputs.pr_number }}
-          REVIEW_WORKFLOW_REF: 018c1969d2abd1e397d88b0bb6875d5932915c82 # pragma: allowlist secret
+          REVIEW_WORKFLOW_REF: dcfeafca4a171e56cd11f2db74c14e0592a288a6 # pragma: allowlist secret
         id: admission
         name: Deduplicate active exact-head review requests
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
@@ -347,6 +347,7 @@ jobs:
     # separately allowlisted; advancing it requires a reviewed PR.
     uses: ./.github/workflows/codex-cli-review-receipt.yml
     with:
+      review_release_id: review-2026-09-21.57
       # workflow_dispatch inputs arrive as strings. Convert explicitly so the
       # reusable workflow's number input receives a JSON number, not "19".
       pr_number: ${{ github.event_name == 'workflow_dispatch' && fromJSON(inputs.pr_number) || 0 }}
