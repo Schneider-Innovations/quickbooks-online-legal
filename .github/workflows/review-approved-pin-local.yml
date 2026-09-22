@@ -42,6 +42,7 @@ jobs:
         Schneider-Innovations/amazon-store-outpost-legal=9b189132da47c3fc82f96fba6a1d8a0580091344
         Schneider-Innovations/amazon-store-outpost-legal=ab0a6642d94ae0dcd6d62131148396531cca3eff
         Schneider-Innovations/amazon-store-outpost-legal=b0a7baa85894f3be1550a53132d336c2f466056d
+        Schneider-Innovations/amazon-store-outpost-legal=b8b9398f2e3d59acda80e0c072d5f8e618addf1f
         Schneider-Innovations/amazon-store-outpost-legal=c018ae92e0e590488e9c432c1d220f2717b1560a
         Schneider-Innovations/amazon-store-outpost-legal=c7a03f81efe21968b8799171e0c4fe16d7eceddd
         Schneider-Innovations/amazon-store-outpost-legal=c7e289e07d78e3819e4feedc05995cfc51a058bf
@@ -73,6 +74,7 @@ jobs:
         Schneider-Innovations/quickbooks-online-legal=9b189132da47c3fc82f96fba6a1d8a0580091344
         Schneider-Innovations/quickbooks-online-legal=ab0a6642d94ae0dcd6d62131148396531cca3eff
         Schneider-Innovations/quickbooks-online-legal=b0a7baa85894f3be1550a53132d336c2f466056d
+        Schneider-Innovations/quickbooks-online-legal=b8b9398f2e3d59acda80e0c072d5f8e618addf1f
         Schneider-Innovations/quickbooks-online-legal=c018ae92e0e590488e9c432c1d220f2717b1560a
         Schneider-Innovations/quickbooks-online-legal=c7a03f81efe21968b8799171e0c4fe16d7eceddd
         Schneider-Innovations/quickbooks-online-legal=c7e289e07d78e3819e4feedc05995cfc51a058bf
@@ -91,6 +93,7 @@ jobs:
         Schneider-Innovations/quickbooks-online-legal=ffcf5c3a74924e6bcd1eaad568a1c222f67dea80
       APPROVED_REUSABLE_REFS: |
         0184a8e1d905b285b5357a50d08d1877edcb62de
+        018c1969d2abd1e397d88b0bb6875d5932915c82
         04d48347aadaa4b61554e4c62f8e5d585b6c6326
         07a91a13cd48f89f5950de7924c0a6a7ae1062bf
         0a32c354464b4289ad7c791434ac0ded5dfa00f5
