@@ -27,6 +27,11 @@ on:
         required: false
         type: string
         default: ''
+      review_release_id:
+        description: Immutable Platform Review Release identifier bound by the caller.
+        required: false
+        type: string
+        default: ''
     # Every protected caller has one canonical, guarded secret mapping. Keep
     # the interface declaration so GitHub can validate the reusable call, but
     # never reference this secret in a job, environment, or bridge command.
@@ -565,6 +570,10 @@ jobs:
           REQUEST_GENERATION: ${{ inputs.request_generation }}
           BASE_BRANCH: ${{ inputs.base_branch }}
           REVIEW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          REVIEW_RELEASE_ID: ${{ inputs.review_release_id }}
+          CALLED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          CALLED_WORKFLOW_PATH: ${{ job.workflow_file_path }}
+          CALLED_WORKFLOW_SHA: ${{ job.workflow_sha }}
         with:
           script: |
             const fs = require('fs');
@@ -1286,14 +1295,30 @@ jobs:
               ) {
                 throw new Error('AI_REVIEW_CHECK_ARCHIVE_RESPONSE_INVALID');
               }
+              const releaseId = process.env.REVIEW_RELEASE_ID || '';
+              const workflowRepository = process.env.CALLED_WORKFLOW_REPOSITORY || '';
+              const workflowPath = process.env.CALLED_WORKFLOW_PATH || '';
+              const workflowSha = process.env.CALLED_WORKFLOW_SHA || '';
+              if (
+                !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(workflowRepository) ||
+                workflowPath !== '.github/workflows/codex-cli-review-receipt.yml' ||
+                !/^[0-9a-f]{40}$/.test(workflowSha) ||
+                (releaseId && !/^review-[0-9]{4}-[0-9]{2}-[0-9]{2}\.[0-9]+$/.test(releaseId))
+              ) {
+                throw new Error('AI_REVIEW_CHECK_ARCHIVE_PROVENANCE_INVALID');
+              }
               const exported = {
-                schema: 'ai-review-check-export/v1',
+                schema: releaseId ? 'ai-review-check-export/v2' : 'ai-review-check-export/v1',
                 repository: `${context.repo.owner}/${context.repo.repo}`,
                 workflow_run_id: context.runId,
                 workflow_run_attempt: reviewRunAttempt,
                 recorded_at: new Date().toISOString(),
                 check_run: selected,
               };
+              if (releaseId) {
+                exported.workflow_ref = `${workflowRepository}/${workflowPath}@${workflowSha}`;
+                exported.release_id = releaseId;
+              }
               const bytes = Buffer.from(`${JSON.stringify(exported)}\n`, 'utf8');
               if (bytes.length > 128 * 1024) {
                 throw new Error('AI_REVIEW_CHECK_ARCHIVE_EXPORT_TOO_LARGE');
