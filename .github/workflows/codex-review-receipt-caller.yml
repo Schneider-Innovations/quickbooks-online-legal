@@ -365,12 +365,15 @@ jobs:
     permissions:
       checks: write
       contents: read
+      actions: read
+      issues: read
       pull-requests: read
     steps:
       - name: Reconcile only a verified synthetic merge invalidation
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
           PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || 0 }}
+          AUTOMATION_LOGIN: ${{ vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231' }}
         with:
           script: |
             const number = Number(process.env.PR_NUMBER) || context.payload.pull_request?.number;
@@ -385,6 +388,18 @@ jobs:
             const currentPr = (value) => value.state === 'open' && !value.draft &&
               value.base.ref === 'main' && value.head.repo?.full_name === `${owner}/${repo}` &&
               (value.labels || []).some((item) => item.name === label);
+            // Only the authorized label event may reconcile an earlier marker.
+            // A workflow_dispatch review can still publish its head receipt, but
+            // cannot silently undo a separate final-head invalidation.
+            const authorizedLabelEvent = context.eventName === 'pull_request_target' &&
+              context.payload.action === 'labeled' && context.payload.label?.name === label &&
+              context.actor === process.env.AUTOMATION_LOGIN &&
+              context.payload.pull_request?.number === number &&
+              context.payload.pull_request?.head.sha === pr.head.sha;
+            if (!authorizedLabelEvent) {
+              core.setFailed('AI_REVIEW_RECONCILE_REQUEST_EVENT_NOT_AUTHORIZED');
+              return;
+            }
             if (!currentPr(pr)) {
               core.setFailed('AI_REVIEW_RECONCILE_PR_NOT_CURRENT');
               return;
@@ -467,11 +482,54 @@ jobs:
               core.setFailed('AI_REVIEW_RECONCILE_MARKER_UNEXPECTED');
               return;
             }
+            const markerRunMatch = marker.external_id.match(
+              new RegExp(`^ai-review-invalidated:merge:${number}:${head}:${merge}:([1-9][0-9]*)$`));
+            const markerRunId = Number(markerRunMatch?.[1]);
+            if (!Number.isSafeInteger(markerRunId)) {
+              core.setFailed('AI_REVIEW_RECONCILE_MARKER_RUN_INVALID');
+              return;
+            }
+            const [requestRunResponse, markerRunResponse] = await Promise.all([
+              github.rest.actions.getWorkflowRun({ owner, repo, run_id: context.runId }),
+              github.rest.actions.getWorkflowRun({ owner, repo, run_id: markerRunId }),
+            ]);
+            const requestRun = requestRunResponse.data;
+            const markerRun = markerRunResponse.data;
+            const callerPath = '.github/workflows/codex-review-receipt-caller.yml';
+            const requestTime = Date.parse(requestRun.created_at);
+            const markerTime = Date.parse(marker.completed_at);
+            const markerRunTime = Date.parse(markerRun.created_at);
+            if (requestRun.path !== callerPath || requestRun.event !== 'pull_request_target' ||
+                requestRun.actor?.login !== process.env.AUTOMATION_LOGIN ||
+                markerRun.path !== callerPath || markerRun.event !== 'pull_request_target' ||
+                !Number.isFinite(requestTime) || !Number.isFinite(markerTime) ||
+                !Number.isFinite(markerRunTime) || markerRunTime > markerTime ||
+                markerTime >= requestTime) {
+              core.setFailed('AI_REVIEW_RECONCILE_MARKER_NOT_PRIOR_TO_REQUEST');
+              return;
+            }
+            const readyEvents = async () => (await github.paginate(github.rest.issues.listEvents,
+              { owner, repo, issue_number: number, per_page: 100 }))
+              .filter((event) => event.label?.name === label &&
+                ['labeled', 'unlabeled'].includes(event.event))
+              .sort((a, b) => Number(b.id) - Number(a.id));
+            const ready = await readyEvents();
+            const latestReady = ready[0];
+            const labelTime = Date.parse(latestReady?.created_at);
+            if (!latestReady || latestReady.event !== 'labeled' ||
+                latestReady.actor?.login !== process.env.AUTOMATION_LOGIN ||
+                !Number.isFinite(labelTime) || markerTime >= labelTime ||
+                labelTime > requestTime ||
+                ready.filter((event) => Date.parse(event.created_at) === requestTime).length > 1) {
+              core.setFailed('AI_REVIEW_RECONCILE_LABEL_EVENT_CHANGED');
+              return;
+            }
             const [freshPr, freshRef, freshHead, freshMerge] = await Promise.all([
               getPr(), github.rest.git.getRef({ owner, repo, ref }), checksAt(head), checksAt(merge),
             ]);
             const freshReceipt = newest(freshHead, (check) => check.name === 'ai-review/receipt');
             const freshMarker = markerAt(freshMerge);
+            const freshReady = (await readyEvents())[0];
             if (!currentPr(freshPr) || freshPr.head.sha.toLowerCase() !== head ||
                 freshPr.base.sha.toLowerCase() !== base ||
                 freshRef.data.object?.sha?.toLowerCase() !== merge ||
@@ -483,7 +541,9 @@ jobs:
                 freshMarker?.id !== marker.id || freshMarker?.status !== marker.status ||
                 freshMarker?.conclusion !== marker.conclusion ||
                 freshMarker?.external_id !== marker.external_id ||
-                freshMarker?.output?.title !== marker.output?.title) {
+                freshMarker?.output?.title !== marker.output?.title ||
+                freshMarker?.completed_at !== marker.completed_at ||
+                freshReady?.id !== latestReady.id) {
               core.setFailed('AI_REVIEW_RECONCILE_FINAL_FENCE_CHANGED');
               return;
             }
