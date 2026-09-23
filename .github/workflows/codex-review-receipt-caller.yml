@@ -46,7 +46,7 @@ jobs:
     steps:
       - env:
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.client_payload.pr_number || github.event.inputs.pr_number }}
-          REVIEW_WORKFLOW_REF: dcfeafca4a171e56cd11f2db74c14e0592a288a6 # pragma: allowlist secret
+          REVIEW_WORKFLOW_REF: d51188eb6386c9c1bbb0551a03c5907b1745c905 # pragma: allowlist secret
         id: admission
         name: Deduplicate active exact-head review requests
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
@@ -357,3 +357,141 @@ jobs:
       automation_login: ${{ vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231' }}
     secrets:
       codex_trigger_token: ${{ secrets.CODEX_REVIEW_TRIGGER_TOKEN }}
+
+  reconcile-merge-invalidation:
+    needs: request-and-verify-review
+    if: needs.request-and-verify-review.result == 'success'
+    runs-on: ${{ fromJSON(vars.CI_GENERAL_RUNS_ON || vars.CI_RUNS_ON || (github.event.repository.private == false && '["ubuntu-latest"]' || '["self-hosted","Linux","X64","linux-general"]')) }}
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Reconcile only a verified synthetic merge invalidation
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          PR_NUMBER: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number || 0 }}
+        with:
+          script: |
+            const number = Number(process.env.PR_NUMBER) || context.payload.pull_request?.number;
+            if (!Number.isSafeInteger(number) || number <= 0) {
+              core.setFailed('AI_REVIEW_RECONCILE_PR_REQUIRED');
+              return;
+            }
+            const { owner, repo } = context.repo;
+            const label = 'ready-for-final-review';
+            const getPr = async () => (await github.rest.pulls.get({ owner, repo, pull_number: number })).data;
+            const pr = await getPr();
+            const currentPr = (value) => value.state === 'open' && !value.draft &&
+              value.base.ref === 'main' && value.head.repo?.full_name === `${owner}/${repo}` &&
+              (value.labels || []).some((item) => item.name === label);
+            if (!currentPr(pr)) {
+              core.setFailed('AI_REVIEW_RECONCILE_PR_NOT_CURRENT');
+              return;
+            }
+            const head = pr.head.sha.toLowerCase();
+            const base = pr.base.sha.toLowerCase();
+            const checksAt = (ref) => github.paginate(github.rest.checks.listForRef,
+              { owner, repo, ref, per_page: 100, filter: 'all' });
+            const newest = (checks, predicate) => checks.filter(predicate)
+              .sort((a, b) => Number(b.id) - Number(a.id))[0] || null;
+            const parse = (check) => {
+              const text = check?.output?.text;
+              if (typeof text !== 'string' || !text || text.length > 65_535) return null;
+              const fenced = text.match(/^```json\s*\n([\s\S]*?)\n```\s*$/);
+              try {
+                const value = JSON.parse(fenced ? fenced[1] : text);
+                return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+              } catch { return null; }
+            };
+            const headChecks = await checksAt(head);
+            const receiptPrefix = `ai-cli-review:${number}:${head}:run:${context.runId}:`;
+            const receipt = newest(headChecks, (check) => check.name === 'ai-review/receipt' &&
+              check.app?.id === 15368 && check.external_id?.startsWith(receiptPrefix));
+            const result = parse(receipt);
+            const binding = result?.trusted_binding;
+            if (receipt?.status !== 'completed' || receipt.conclusion !== 'success' ||
+                result?.status !== 'completed' || result?.decision !== 'PASS' ||
+                result?.analysis_complete !== true ||
+                result?.pr_number !== number ||
+                result?.head_sha?.toLowerCase() !== head || result?.base_sha?.toLowerCase() !== base ||
+                binding?.repository !== `${owner}/${repo}` || binding?.pr_number !== number ||
+                binding?.head_sha?.toLowerCase() !== head || binding?.base_sha?.toLowerCase() !== base) {
+              core.setFailed('AI_REVIEW_RECONCILE_RECEIPT_NOT_VERIFIED');
+              return;
+            }
+            const ref = `pull/${number}/merge`;
+            const merge = (await github.rest.git.getRef({ owner, repo, ref })).data.object?.sha?.toLowerCase();
+            if (!/^[0-9a-f]{40}$/.test(merge || '')) {
+              core.setFailed('AI_REVIEW_RECONCILE_MERGE_REF_INVALID');
+              return;
+            }
+            const commit = (await github.rest.repos.getCommit({ owner, repo, ref: merge })).data;
+            const parents = (commit.parents || []).map((item) => item.sha.toLowerCase());
+            if (parents.length !== 2 || !parents.includes(base) || !parents.includes(head) ||
+                result.merge_sha?.toLowerCase() !== merge ||
+                binding.reviewed_merge_sha?.toLowerCase() !== merge ||
+                binding.merge_tree_sha?.toLowerCase() !== commit.commit.tree.sha.toLowerCase()) {
+              core.setFailed('AI_REVIEW_RECONCILE_MERGE_NOT_VERIFIED');
+              return;
+            }
+            const verdictId = `ai-review/verdict:${number}:${head}:${merge}:${context.runId}:head`;
+            const executionId = `ai-review/execution:${number}:${head}:${merge}:${context.runId}:head`;
+            const passed = (checks, name, id) => newest(checks, (check) => check.name === name &&
+              check.app?.id === 15368 && check.external_id === id &&
+              check.status === 'completed' && check.conclusion === 'success');
+            const verdict = passed(headChecks, 'ai-review/verdict', verdictId);
+            const execution = passed(headChecks, 'ai-review/execution', executionId);
+            if (!verdict || !execution) {
+              core.setFailed('AI_REVIEW_RECONCILE_VERDICT_NOT_VERIFIED');
+              return;
+            }
+            const prefix = `ai-review-invalidated:merge:${number}:${head}:${merge}:`;
+            const markerAt = (checks) => newest(checks, (check) => check.name === 'ai-review/receipt' &&
+              check.app?.id === 15368 && check.external_id?.startsWith(prefix));
+            const marker = markerAt(await checksAt(merge));
+            if (!marker) {
+              core.notice('AI_REVIEW_RECONCILE_MARKER_NOT_NEEDED');
+              return;
+            }
+            const alreadyDone = (check) => check.status === 'completed' &&
+              check.conclusion === 'neutral' && check.output?.title === 'Synthetic merge invalidation reconciled';
+            if (alreadyDone(marker)) {
+              core.notice('AI_REVIEW_RECONCILE_ALREADY_DONE');
+              return;
+            }
+            if (marker.status !== 'completed' ||
+                !['failure', 'action_required'].includes(marker.conclusion) ||
+                !['Final-head AI review required', 'Final-head AI review not requested']
+                  .includes(marker.output?.title)) {
+              core.setFailed('AI_REVIEW_RECONCILE_MARKER_UNEXPECTED');
+              return;
+            }
+            const [freshPr, freshRef, freshHead, freshMerge] = await Promise.all([
+              getPr(), github.rest.git.getRef({ owner, repo, ref }), checksAt(head), checksAt(merge),
+            ]);
+            const freshReceipt = newest(freshHead, (check) => check.name === 'ai-review/receipt');
+            const freshMarker = markerAt(freshMerge);
+            if (!currentPr(freshPr) || freshPr.head.sha.toLowerCase() !== head ||
+                freshPr.base.sha.toLowerCase() !== base ||
+                freshRef.data.object?.sha?.toLowerCase() !== merge ||
+                freshReceipt?.id !== receipt.id || freshReceipt.conclusion !== 'success' ||
+                freshReceipt?.external_id !== receipt.external_id ||
+                freshReceipt?.output?.text !== receipt.output?.text ||
+                passed(freshHead, 'ai-review/verdict', verdictId)?.id !== verdict.id ||
+                passed(freshHead, 'ai-review/execution', executionId)?.id !== execution.id ||
+                freshMarker?.id !== marker.id || freshMarker?.status !== marker.status ||
+                freshMarker?.conclusion !== marker.conclusion ||
+                freshMarker?.external_id !== marker.external_id ||
+                freshMarker?.output?.title !== marker.output?.title) {
+              core.setFailed('AI_REVIEW_RECONCILE_FINAL_FENCE_CHANGED');
+              return;
+            }
+            await github.rest.checks.update({
+              owner, repo, check_run_id: marker.id, status: 'completed', conclusion: 'neutral',
+              completed_at: new Date().toISOString(),
+              output: {
+                title: 'Synthetic merge invalidation reconciled',
+                summary: 'Exact head, base, merge parents and tree, receipt, execution and verdict were verified twice. The original review PASS remains on the head.',
+              },
+            });
