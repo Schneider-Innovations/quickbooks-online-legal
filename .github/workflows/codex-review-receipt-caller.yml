@@ -360,7 +360,11 @@ jobs:
 
   reconcile-merge-invalidation:
     needs: request-and-verify-review
-    if: needs.request-and-verify-review.result == 'success'
+    if: >-
+      needs.request-and-verify-review.result == 'success' &&
+      github.event_name == 'pull_request_target' &&
+      github.event.action == 'labeled' &&
+      github.event.label.name == 'ready-for-final-review'
     runs-on: ${{ fromJSON(vars.CI_GENERAL_RUNS_ON || vars.CI_RUNS_ON || (github.event.repository.private == false && '["ubuntu-latest"]' || '["self-hosted","Linux","X64","linux-general"]')) }}
     permissions:
       checks: write
@@ -496,12 +500,14 @@ jobs:
             const requestRun = requestRunResponse.data;
             const markerRun = markerRunResponse.data;
             const callerPath = '.github/workflows/codex-review-receipt-caller.yml';
+            const protectedCallerPath = (run) => run.path === callerPath ||
+              run.path === `${callerPath}@refs/heads/main`;
             const requestTime = Date.parse(requestRun.created_at);
             const markerTime = Date.parse(marker.completed_at);
             const markerRunTime = Date.parse(markerRun.created_at);
-            if (requestRun.path !== callerPath || requestRun.event !== 'pull_request_target' ||
+            if (!protectedCallerPath(requestRun) || requestRun.event !== 'pull_request_target' ||
                 requestRun.actor?.login !== process.env.AUTOMATION_LOGIN ||
-                markerRun.path !== callerPath || markerRun.event !== 'pull_request_target' ||
+                !protectedCallerPath(markerRun) || markerRun.event !== 'pull_request_target' ||
                 !Number.isFinite(requestTime) || !Number.isFinite(markerTime) ||
                 !Number.isFinite(markerRunTime) || markerRunTime > markerTime ||
                 markerTime >= requestTime) {
