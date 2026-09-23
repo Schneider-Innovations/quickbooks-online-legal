@@ -797,6 +797,8 @@ jobs:
               '9193950b3ce6ceac2c1cbbc4d96217cea2dabaeba3ab27b9f4735d42bfc8dbf5',
               '3a702e2fa7c8bdc0387d935ab7a7f2cef1e2e5d6dd28af1e9c2e28c7cdabced7',
               '15439fbc929894254187a5f068b3f96ebdead087b24afe0419a4c3b40b12f9b2',
+              // Release 59 candidate policy: admitted before activation.
+              '487b8e2d43db74160c50b6e76b9ca7b99dfd5591d7719c5807e2181387921d61',
             ]);
             const changed = await github.paginate(github.rest.pulls.listFiles, {
               ...context.repo,
