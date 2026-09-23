@@ -7,6 +7,9 @@ const workflow = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflow
   'codex-review-receipt-caller.yml'), 'utf8').split(/\r?\n/);
 const step = workflow.findIndex((line) => line.includes('name: Reconcile only a verified synthetic merge invalidation'));
 assert(step >= 0);
+const jobStart = workflow.findIndex((line) => line === '  reconcile-merge-invalidation:');
+assert(jobStart >= 0);
+assert(workflow.slice(jobStart, step).some((line) => line.includes("github.event_name == 'pull_request_target'")));
 const scriptStart = workflow.findIndex((line, index) => index > step && line === '          script: |');
 assert(scriptStart > step);
 const script = [];
@@ -80,7 +83,10 @@ async function scenario(options = {}) {
       repos: { getCommit: async () => ({ data: { parents: [{ sha: base }, { sha: head }],
         commit: { tree: { sha: tree } } } }) },
       actions: { getWorkflowRun: async ({ run_id }) => ({ data: {
-        path: '.github/workflows/codex-review-receipt-caller.yml', event: 'pull_request_target',
+        path: options.foreignPath ? '.github/workflows/other.yml'
+          : '.github/workflows/codex-review-receipt-caller.yml' +
+            (options.pathSuffix ? '@refs/heads/main' : ''),
+        event: 'pull_request_target',
         actor: { login: 'mercury1231' },
         created_at: run_id === runId ? requestTime : '2026-09-23T09:00:00Z',
       } }) },
@@ -99,6 +105,14 @@ async function scenario(options = {}) {
   assert.deepEqual(valid.failures, []);
   assert.equal(valid.updates.length, 1);
   assert.equal(valid.updates[0].conclusion, 'neutral');
+
+  const suffixed = await scenario({ pathSuffix: true });
+  assert.deepEqual(suffixed.failures, []);
+  assert.equal(suffixed.updates.length, 1);
+
+  const foreignPath = await scenario({ foreignPath: true });
+  assert.deepEqual(foreignPath.failures, ['AI_REVIEW_RECONCILE_MARKER_NOT_PRIOR_TO_REQUEST']);
+  assert.equal(foreignPath.updates.length, 0);
 
   const late = await scenario({ lateMarker: true });
   assert.deepEqual(late.failures, ['AI_REVIEW_RECONCILE_MARKER_NOT_PRIOR_TO_REQUEST']);
