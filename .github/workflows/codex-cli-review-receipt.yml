@@ -28,7 +28,12 @@ on:
         type: string
         default: ''
       review_release_id:
-        description: Immutable Platform Review Release identifier bound by the caller.
+        description: Deprecated bounded compatibility input for pre-protocol callers.
+        required: false
+        type: string
+        default: ''
+      review_caller_contract_version:
+        description: Stable Review caller protocol version; the central verifier derives the active release.
         required: false
         type: string
         default: ''
@@ -571,6 +576,7 @@ jobs:
           BASE_BRANCH: ${{ inputs.base_branch }}
           REVIEW_RUN_ATTEMPT: ${{ github.run_attempt }}
           REVIEW_RELEASE_ID: ${{ inputs.review_release_id }}
+          REVIEW_CALLER_CONTRACT_VERSION: ${{ inputs.review_caller_contract_version }}
           CALLED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
           CALLED_WORKFLOW_PATH: ${{ job.workflow_file_path }}
           CALLED_WORKFLOW_SHA: ${{ job.workflow_sha }}
@@ -828,6 +834,14 @@ jobs:
             const coverageComplete = receipt && sameSortedStrings(receipt.changed_files, expectedChangedFiles) &&
               sameSortedStrings(receipt.reviewed_files, expectedChangedFiles) &&
               Array.isArray(receipt.omitted_files) && receipt.omitted_files.length === 0;
+            const runtimeRelease = receipt?.runtime_release;
+            const runtimeReleaseValid = runtimeRelease && typeof runtimeRelease === 'object' &&
+              Object.keys(runtimeRelease).length === 5 &&
+              /^review-[0-9]{4}-[0-9]{2}-[0-9]{2}\.[0-9]+$/.test(runtimeRelease.release_id || '') &&
+              /^[0-9a-f]{64}$/.test(runtimeRelease.release_manifest_sha256 || '') &&
+              /^[0-9a-f]{64}$/.test(runtimeRelease.agent_artifact_sha256 || '') &&
+              runtimeRelease.policy_digest === receipt?.policy_digest &&
+              runtimeRelease.receipt_schema_version === receipt?.schema_version;
             const reviewResultEnvelope = receipt &&
               (receipt.result_kind === undefined || receipt.result_kind === 'review_result');
             const contractValidExceptPolicyDigest = reviewResultEnvelope &&
@@ -854,6 +868,10 @@ jobs:
               Object.hasOwn(receipt.runtime, 'harness') && Object.hasOwn(receipt.runtime, 'version') &&
               typeof receipt.runtime.harness === 'string' && receipt.runtime.harness.length > 0 &&
               typeof receipt.runtime.version === 'string' && receipt.runtime.version.length > 0;
+            const callerContractVersion = process.env.REVIEW_CALLER_CONTRACT_VERSION || '';
+            const releaseProvenanceValid = callerContractVersion
+              ? callerContractVersion === '1' && runtimeReleaseValid
+              : (runtimeRelease === undefined || runtimeReleaseValid);
             const parisCandidateDigest = '22436b564a2ee723af4b40328c14cab67d73b5effc5e7b1545fd69bc28e80ba1';
             // Stage one records compatibility without accepting an inactive Agent.
             // A separate reviewed activation revision must change this after
@@ -864,7 +882,7 @@ jobs:
               (parisCandidateActive && receipt.policy_digest === parisCandidateDigest &&
                 `${context.repo.owner}/${context.repo.repo}` === 'Schneider-Innovations/Project-QR')
             );
-            const valid = contractValidExceptPolicyDigest && policyDigestAllowed;
+            const valid = contractValidExceptPolicyDigest && policyDigestAllowed && releaseProvenanceValid;
             // Policy v2: severity alone determines code blocking. First review,
             // changed files, unavailable baseline comparisons and repeat reviews
             // never promote medium/low to blocking. Identity, policy and complete
@@ -1298,6 +1316,7 @@ jobs:
                 throw new Error('AI_REVIEW_CHECK_ARCHIVE_RESPONSE_INVALID');
               }
               const releaseId = process.env.REVIEW_RELEASE_ID || '';
+              const protocolVersion = process.env.REVIEW_CALLER_CONTRACT_VERSION || '';
               const workflowRepository = process.env.CALLED_WORKFLOW_REPOSITORY || '';
               const workflowPath = process.env.CALLED_WORKFLOW_PATH || '';
               const workflowSha = process.env.CALLED_WORKFLOW_SHA || '';
@@ -1305,12 +1324,16 @@ jobs:
                 !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(workflowRepository) ||
                 workflowPath !== '.github/workflows/codex-cli-review-receipt.yml' ||
                 !/^[0-9a-f]{40}$/.test(workflowSha) ||
-                (releaseId && !/^review-[0-9]{4}-[0-9]{2}-[0-9]{2}\.[0-9]+$/.test(releaseId))
+                (releaseId && !/^review-[0-9]{4}-[0-9]{2}-[0-9]{2}\.[0-9]+$/.test(releaseId)) ||
+                (protocolVersion && protocolVersion !== '1') ||
+                (releaseId && protocolVersion)
               ) {
                 throw new Error('AI_REVIEW_CHECK_ARCHIVE_PROVENANCE_INVALID');
               }
               const exported = {
-                schema: releaseId ? 'ai-review-check-export/v2' : 'ai-review-check-export/v1',
+                schema: protocolVersion
+                  ? 'ai-review-check-export/v3'
+                  : (releaseId ? 'ai-review-check-export/v2' : 'ai-review-check-export/v1'),
                 repository: `${context.repo.owner}/${context.repo.repo}`,
                 workflow_run_id: context.runId,
                 workflow_run_attempt: reviewRunAttempt,
@@ -1319,7 +1342,12 @@ jobs:
               };
               if (releaseId) {
                 exported.workflow_ref = `${workflowRepository}/${workflowPath}@${workflowSha}`;
-                exported.release_id = releaseId;
+                exported.caller_claimed_release_id = releaseId;
+              }
+              if (protocolVersion) {
+                exported.workflow_ref = `${workflowRepository}/${workflowPath}@${workflowSha}`;
+                exported.caller_contract_version = protocolVersion;
+                exported.runtime_release = output.runtime_release;
               }
               const bytes = Buffer.from(`${JSON.stringify(exported)}\n`, 'utf8');
               if (bytes.length > 128 * 1024) {
