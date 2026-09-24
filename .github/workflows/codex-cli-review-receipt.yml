@@ -835,8 +835,14 @@ jobs:
               sameSortedStrings(receipt.reviewed_files, expectedChangedFiles) &&
               Array.isArray(receipt.omitted_files) && receipt.omitted_files.length === 0;
             const runtimeRelease = receipt?.runtime_release;
-            const runtimeReleaseValid = runtimeRelease && typeof runtimeRelease === 'object' &&
-              Object.keys(runtimeRelease).length === 5 &&
+            const runtimeReleaseFields = runtimeRelease && typeof runtimeRelease === 'object'
+              ? Object.keys(runtimeRelease).length : 0;
+            const runtimeReleaseModelValid = runtimeReleaseFields === 5 || (
+              runtimeReleaseFields === 7 &&
+              /^[A-Za-z0-9._:-]{1,128}$/.test(runtimeRelease.model_id || '') &&
+              /^[0-9a-f]{64}$/.test(runtimeRelease.model_configuration_sha256 || '')
+            );
+            const runtimeReleaseValid = runtimeReleaseModelValid &&
               /^review-[0-9]{4}-[0-9]{2}-[0-9]{2}\.[0-9]+$/.test(runtimeRelease.release_id || '') &&
               /^[0-9a-f]{64}$/.test(runtimeRelease.release_manifest_sha256 || '') &&
               /^[0-9a-f]{64}$/.test(runtimeRelease.agent_artifact_sha256 || '') &&
