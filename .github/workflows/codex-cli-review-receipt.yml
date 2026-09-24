@@ -805,8 +805,10 @@ jobs:
               '15439fbc929894254187a5f068b3f96ebdead087b24afe0419a4c3b40b12f9b2',
               // Release 59 candidate policy: admitted before activation.
               '487b8e2d43db74160c50b6e76b9ca7b99dfd5591d7719c5807e2181387921d61',
-              // Linked-context Agent candidate; keep the active Release 72 digest.
+              // Release 74 linked-context Agent candidate; retain Release 72 compatibility.
               '3d7ea2e60ffefa01c6a2bc99d5b5fdb29cc989031a027864a2e9d1acc68a35b6',
+              // Large-review page coverage candidate; admission precedes Agent activation.
+              '7630cc21df2139d8623045a0c5d79549b9e43ede3cc201a0ecdab7ff2b8c41e9',
             ]);
             const changed = await github.paginate(github.rest.pulls.listFiles, {
               ...context.repo,
