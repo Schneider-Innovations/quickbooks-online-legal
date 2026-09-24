@@ -278,6 +278,7 @@ jobs:
               );
               const existing = existingChecks.find((check) =>
                 check.name === 'ai-review/receipt' &&
+                  check.app?.id === 15368 &&
                   check.status !== 'completed' &&
                   check.external_id?.startsWith(`${externalIdPrefix}:`),
               );
@@ -533,7 +534,8 @@ jobs:
             const [freshPr, freshRef, freshHead, freshMerge] = await Promise.all([
               getPr(), github.rest.git.getRef({ owner, repo, ref }), checksAt(head), checksAt(merge),
             ]);
-            const freshReceipt = newest(freshHead, (check) => check.name === 'ai-review/receipt');
+            const freshReceipt = newest(freshHead, (check) =>
+              check.name === 'ai-review/receipt' && check.app?.id === 15368);
             const freshMarker = markerAt(freshMerge);
             const freshReady = (await readyEvents())[0];
             if (!currentPr(freshPr) || freshPr.head.sha.toLowerCase() !== head ||
