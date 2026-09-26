@@ -189,24 +189,39 @@ jobs:
                 core.notice('AI_REVIEW_NEWER_READINESS_LABEL_PRESERVED');
               }
             }
-      # Organization policy keeps GITHUB_TOKEN read-only. This narrow token is
-      # repository-scoped and used only to remove a stale readiness label; no
-      # pull-request code is checked out or executed by this base-owned job.
-      - name: Remove stale final-head review label
+      # Organization policy keeps GITHUB_TOKEN read-only. A dedicated review
+      # label App mints a token scoped to this repository and pull-requests
+      # write only; it is used only to remove a stale readiness label. No
+      # personal-account credential is involved, and no pull-request code is
+      # checked out or executed by this base-owned job.
+      - name: Mint scoped review-label token
         if: (always()) && steps.invalidation-current.outputs.current == 'true'
+        id: review-label-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.AI_REVIEW_LABELER_APP_ID }}
+          private-key: ${{ secrets.AI_REVIEW_LABELER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-pull-requests: write
+      - name: Remove stale final-head review label
+        if: (always()) && steps.invalidation-current.outputs.current == 'true' && steps.review-label-token.outcome == 'success'
         id: remove-stale-label
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
-          EXPECTED_TOKEN_OWNER: ${{ vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231' }}
+          EXPECTED_APP_SLUG: ${{ vars.AI_REVIEW_LABELER_APP_SLUG }}
+          ACTUAL_APP_SLUG: ${{ steps.review-label-token.outputs.app-slug }}
         with:
-          github-token: ${{ secrets.CODEX_REVIEW_TRIGGER_TOKEN }}
+          github-token: ${{ steps.review-label-token.outputs.token }}
           script: |
             const label = 'ready-for-final-review';
             const pr = context.payload.pull_request;
             const { owner, repo } = context.repo;
-            const expectedOwner = process.env.EXPECTED_TOKEN_OWNER.toLowerCase();
-            const authenticated = await github.rest.users.getAuthenticated();
-            if (authenticated.data.login?.toLowerCase() !== expectedOwner) {
+            // An installation token cannot call GET /user. Bind the token to the
+            // configured App instead, and fail closed when either side is unset.
+            const expectedSlug = (process.env.EXPECTED_APP_SLUG || '').toLowerCase();
+            const actualSlug = (process.env.ACTUAL_APP_SLUG || '').toLowerCase();
+            if (!expectedSlug || actualSlug !== expectedSlug) {
               core.setFailed('AI_REVIEW_TRIGGER_IDENTITY_MISMATCH');
               return;
             }
