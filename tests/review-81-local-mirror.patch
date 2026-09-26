@@ -1,0 +1,120 @@
+diff --git a/.github/workflows/codex-cli-review-receipt.yml b/.github/workflows/codex-cli-review-receipt.yml
+index e15f788..b8f028a 100644
+--- a/.github/workflows/codex-cli-review-receipt.yml
++++ b/.github/workflows/codex-cli-review-receipt.yml
+@@ -37,6 +37,11 @@ on:
+         required: false
+         type: string
+         default: ''
++      verdict_policy:
++        description: Gate verdict policy. finding-disposition/v3 also blocks medium findings; any other value fails closed.
++        required: false
++        type: string
++        default: severity-record-only/v2
+     # Every protected caller has one canonical, guarded secret mapping. Keep
+     # the interface declaration so GitHub can validate the reusable call, but
+     # never reference this secret in a job, environment, or bridge command.
+@@ -577,6 +582,7 @@ jobs:
+           REVIEW_RUN_ATTEMPT: ${{ github.run_attempt }}
+           REVIEW_RELEASE_ID: ${{ inputs.review_release_id }}
+           REVIEW_CALLER_CONTRACT_VERSION: ${{ inputs.review_caller_contract_version }}
++          VERDICT_POLICY: ${{ inputs.verdict_policy }}
+           CALLED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+           CALLED_WORKFLOW_PATH: ${{ job.workflow_file_path }}
+           CALLED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+@@ -893,13 +899,19 @@ jobs:
+                 `${context.repo.owner}/${context.repo.repo}` === 'Schneider-Innovations/Project-QR')
+             );
+             const valid = contractValidExceptPolicyDigest && policyDigestAllowed && releaseProvenanceValid;
+-            // Policy v2: severity alone determines code blocking. First review,
+-            // changed files, unavailable baseline comparisons and repeat reviews
+-            // never promote medium/low to blocking. Identity, policy and complete
+-            // coverage are still validated independently below.
++            // Severity alone determines code blocking. First review, changed
++            // files, unavailable baseline comparisons and repeat reviews never
++            // promote a finding. Policy v2 blocks critical/high and records
++            // medium/low; v3 also blocks medium (fixed, not waived) and records
++            // only low. An unknown policy name fails closed. Identity, policy
++            // digest and complete coverage are still validated independently.
++            const verdictPolicy = process.env.VERDICT_POLICY || 'severity-record-only/v2';
++            const verdictPolicyValid =
++              verdictPolicy === 'severity-record-only/v2' || verdictPolicy === 'finding-disposition/v3';
++            const blockingSeverities = verdictPolicy === 'finding-disposition/v3'
++              ? ['critical', 'high', 'medium'] : ['critical', 'high'];
+             const findingsForTiering = valid ? receipt.findings : [];
+-            const blockingFinding = (finding) =>
+-              finding.severity === 'critical' || finding.severity === 'high';
++            const blockingFinding = (finding) => blockingSeverities.includes(finding.severity);
+             const blockingFindings = findingsForTiering.filter(blockingFinding);
+             const deferredFindings = findingsForTiering.filter((finding) => !blockingFinding(finding));
+             // The review contract permits PASS only with zero findings; a
+@@ -912,7 +924,8 @@ jobs:
+               (receipt.decision === 'PASS' && receipt.findings.length === 0) ||
+               (receipt.decision === 'BLOCK' && receipt.findings.length > 0)
+             );
+-            const clear = valid && decisionAccountedFor && receipt.analysis_complete === true && coverageComplete && blockingFindings.length === 0;
++            const clear = verdictPolicyValid && valid && decisionAccountedFor &&
++              receipt.analysis_complete === true && coverageComplete && blockingFindings.length === 0;
+             let conclusion = clear ? 'success' : 'failure';
+             // An unavailable producer result is not a completed review
+             // contract, but a structurally valid diagnostic envelope must not
+@@ -1053,6 +1066,33 @@ jobs:
+                   : !clear && receipt.decision === 'PASS'
+                     ? 'review_coverage_incomplete'
+                     : `decision_${receipt.decision.toLowerCase()}`;
++            // A caller-supplied policy name is checked before any receipt state.
++            if (!verdictPolicyValid) reason = 'verdict_policy_invalid';
++            // Publish predicate names, never the untrusted result values. This
++            // keeps a failed old-generation receipt diagnosable after the
++            // producer's local result has been removed.
++            const reviewBindingValid = receipt?.request_id === requestId &&
++              receipt?.pr_number === Number(process.env.PR_NUMBER) &&
++              receipt?.head_sha === expectedHead && receipt?.merge_sha === expectedMerge &&
++              receipt?.base_sha === expectedBase && receipt?.merge_base_sha === expectedMergeBase;
++            const diagnosticBindingValid = receipt?.request_id === requestId &&
++              receipt?.head_sha === expectedHead && receipt?.merge_sha === expectedMerge;
++            const failedPredicates = reason !== 'result_contract_invalid' ? [] : [
++              receipt?.status === 'completed' && !reviewResultEnvelope ? 'review_result_kind_invalid' : null,
++              receipt?.status === 'completed' && reviewResultEnvelope && !reviewBindingValid ? 'review_binding_invalid' : null,
++              receipt?.status === 'completed' && reviewResultEnvelope && reviewBindingValid &&
++                !contractValidExceptPolicyDigest ? 'review_contract_fields_invalid' : null,
++              receipt?.status === 'completed' && contractValidExceptPolicyDigest &&
++                policyDigestAllowed && !releaseProvenanceValid ? 'review_release_provenance_invalid' : null,
++              receipt?.status === 'unavailable' && !executionFailureEnvelope ? 'diagnostic_result_kind_invalid' : null,
++              receipt?.status === 'unavailable' && executionFailureEnvelope &&
++                !diagnosticBindingValid ? 'diagnostic_binding_invalid' : null,
++              receipt?.status === 'unavailable' && executionFailureEnvelope && diagnosticBindingValid &&
++                !diagnosticEnvelopeValid ? 'diagnostic_contract_fields_invalid' : null,
++              !['completed', 'unavailable'].includes(receipt?.status) ? 'result_status_invalid' : null,
++            ].filter(Boolean);
++            const contractFailureCodes = reason !== 'result_contract_invalid' ? [] :
++              failedPredicates.length > 0 ? failedPredicates : ['contract_predicate_unclassified'];
+             const executionRetryable = diagnosticEnvelopeValid && (
+               receipt?.attempt?.last_failure_retryable === true ||
+               ['request_not_claimed', 'result_missing_or_malformed'].includes(reason)
+@@ -1176,6 +1216,8 @@ jobs:
+               summary: conclusion === 'success'
+                 ? `${output.summary}${mergeRefObservation}`
+                 : (contextFailureSummary || `Fail-closed Shadow result: ${reason}.`) +
++                  (contractFailureCodes.length > 0
++                    ? ` Contract diagnostics: ${contractFailureCodes.join(', ')}.` : '') +
+                   (bridge_failure_class
+                     ? ` Producer diagnostic: ${bridge_failure_class}` +
+                       (bridge_failure_signals.length > 0 ? ` (${bridge_failure_signals.join(', ')})` : '') +
+@@ -1224,7 +1266,7 @@ jobs:
+                 schema: 'ai-review-deferred/v2',
+                 pr_number: Number(process.env.PR_NUMBER),
+                 head_sha: expectedHead,
+-                policy: 'severity-record-only/v2',
++                policy: verdictPolicy,
+                 issue_projection: 'disabled',
+                 deferred: deferredFindings.map((finding) => ({
+                   severity: finding.severity,
+@@ -1476,6 +1518,7 @@ jobs:
+                 // Preserve that vote separately (medium-only BLOCK may pass).
+                 decision: executionSucceeded ? (verdictPassed ? 'PASS' : 'BLOCK') : null,
+                 review_decision: executionSucceeded ? receipt.decision : null,
++                verdict_policy: verdictPolicy,
+               }),
+             };
+             const publishSplitGate = async (name, gateConclusion, gateOutput) => {
