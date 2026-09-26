@@ -5,6 +5,10 @@ const AsyncFunction = (async function () {}).constructor;
 
 const workflow = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows',
   'codex-review-receipt-caller.yml'), 'utf8').split(/\r?\n/);
+const invalidationLookup = workflow.findIndex((line) => line.includes('const existing = existingChecks.find'));
+assert(invalidationLookup >= 0);
+assert(workflow.slice(invalidationLookup, invalidationLookup + 6)
+  .some((line) => line.includes('check.app?.id === 15368')));
 const step = workflow.findIndex((line) => line.includes('name: Reconcile only a verified synthetic merge invalidation'));
 assert(step >= 0);
 const jobStart = workflow.findIndex((line) => line === '  reconcile-merge-invalidation:');
@@ -60,6 +64,9 @@ async function scenario(options = {}) {
     id: 30 + index, name, app: { id: 15368 }, status: 'completed', conclusion: 'success',
     external_id: `${name}:${number}:${head}:${merge}:${runId}:head`,
   }))];
+  if (options.foreignNewerReceipt) {
+    headChecks.push({ ...receipt, id: 99, app: { id: 99999 } });
+  }
   const readyEvent = { id: 50, event: 'labeled', label: { name: label },
     actor: { login: options.unauthorizedRelabel ? 'other-user' : 'mercury1231' },
     created_at: options.unauthorizedRelabel ? '2026-09-23T09:03:00Z' : '2026-09-23T09:01:59Z' };
@@ -105,6 +112,10 @@ async function scenario(options = {}) {
   assert.deepEqual(valid.failures, []);
   assert.equal(valid.updates.length, 1);
   assert.equal(valid.updates[0].conclusion, 'neutral');
+
+  const foreignNewerReceipt = await scenario({ foreignNewerReceipt: true });
+  assert.deepEqual(foreignNewerReceipt.failures, []);
+  assert.equal(foreignNewerReceipt.updates.length, 1);
 
   const suffixed = await scenario({ pathSuffix: true });
   assert.deepEqual(suffixed.failures, []);
