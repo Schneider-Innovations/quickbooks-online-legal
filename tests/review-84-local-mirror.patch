@@ -1,0 +1,154 @@
+diff --git a/.github/workflows/codex-cli-review-receipt.yml b/.github/workflows/codex-cli-review-receipt.yml
+index b8f028a..bffadb9 100644
+--- a/.github/workflows/codex-cli-review-receipt.yml
++++ b/.github/workflows/codex-cli-review-receipt.yml
+@@ -107,28 +107,39 @@ jobs:
+               core.setFailed('AI_CLI_REVIEW_REQUESTER_FORBIDDEN');
+               return;
+             }
+-            let requesterPermission;
+-            try {
+-              requesterPermission = (await github.rest.repos.getCollaboratorPermissionLevel({
+-                ...context.repo,
+-                username: actor,
+-              })).data;
+-            } catch (error) {
+-              core.setFailed(`AI_CLI_REVIEW_REQUESTER_PERMISSION_UNAVAILABLE:${error.status || 'unknown'}`);
+-              return;
+-            }
+-            const allowedRequesterRoles = new Set(['triage', 'write', 'maintain', 'admin']);
+-            const detailedPermissions = requesterPermission.user?.permissions || {};
+-            const hasAllowedRequesterPermission =
+-              ['triage', 'push', 'maintain', 'admin'].some(
+-                (permission) => detailedPermissions[permission] === true,
+-              ) ||
+-              allowedRequesterRoles.has(requesterPermission.role_name) ||
+-              ['write', 'admin'].includes(requesterPermission.permission);
+             const isLabelRequest =
+               requestedPrNumber === 0 &&
+               context.payload.action === 'labeled' &&
+               context.payload.label?.name === requiredLabel;
++            // The labeler App has no collaborator role. Only base-owned caller
++            // steps hold its token, and they label only after verifying that
++            // the event sender has write access (automatic review on ready and
++            // push) or that the PR opted into auto-rereview. Each caller keeps
++            // its own admission check; this callee accepts either.
++            const isAutomationLabelRequest =
++              isLabelRequest &&
++              actor === 'snd-ai-review-labeler[bot]';
++            let hasAllowedRequesterPermission = isAutomationLabelRequest;
++            if (!isAutomationLabelRequest) {
++              let requesterPermission;
++              try {
++                requesterPermission = (await github.rest.repos.getCollaboratorPermissionLevel({
++                  ...context.repo,
++                  username: actor,
++                })).data;
++              } catch (error) {
++                core.setFailed(`AI_CLI_REVIEW_REQUESTER_PERMISSION_UNAVAILABLE:${error.status || 'unknown'}`);
++                return;
++              }
++              const allowedRequesterRoles = new Set(['triage', 'write', 'maintain', 'admin']);
++              const detailedPermissions = requesterPermission.user?.permissions || {};
++              hasAllowedRequesterPermission =
++                ['triage', 'push', 'maintain', 'admin'].some(
++                  (permission) => detailedPermissions[permission] === true,
++                ) ||
++                allowedRequesterRoles.has(requesterPermission.role_name) ||
++                ['write', 'admin'].includes(requesterPermission.permission);
++            }
+             const isReconciliationRequest =
+               requestedPrNumber > 0 && actor === automationLogin;
+             if (
+@@ -303,6 +314,7 @@ jobs:
+           PR_NUMBER: ${{ steps.context.outputs.pr_number }}
+           REQUEST_ID: ${{ steps.context.outputs.request_id }}
+           REPOSITORY: ${{ github.repository }}
++          REQUEST_GENERATION: ${{ inputs.request_generation }}
+           REVIEW_RUN_ATTEMPT: ${{ github.run_attempt }}
+         run: |
+           set -euo pipefail
+@@ -369,8 +381,14 @@ jobs:
+           if (!Number.isSafeInteger(cancelAttemptNumber) || cancelAttemptNumber < 1) {
+             throw new Error('AI_CLI_REVIEW_CANCEL_ATTEMPT_INVALID');
+           }
++          const requestGeneration = process.env.REQUEST_GENERATION;
++          if (!/^[1-9][0-9]*:[1-9][0-9]*$/.test(requestGeneration || '')) {
++            throw new Error('AI_CLI_REVIEW_REQUEST_GENERATION_INVALID');
++          }
+           const request = {
+             request_id: process.env.REQUEST_ID,
++            request_generation: requestGeneration,
++            enqueued_at: new Date().toISOString(),
+             repository: process.env.REPOSITORY,
+             pr_number: Number(process.env.PR_NUMBER),
+             head_sha: process.env.HEAD_SHA,
+@@ -815,6 +833,12 @@ jobs:
+               '3d7ea2e60ffefa01c6a2bc99d5b5fdb29cc989031a027864a2e9d1acc68a35b6',
+               // Large-review page coverage candidate; admission precedes Agent activation.
+               '7630cc21df2139d8623045a0c5d79549b9e43ede3cc201a0ecdab7ff2b8c41e9',
++              // Verdict-policy-neutral Agent candidate: states that each caller
++              // selects v2 or v3; admission precedes Agent activation.
++              'effade23f1754bb4cc6c6b501d87cfae1cfed58ca790d58e5da320c584df51ec',
++              // Release 83 Agent bundle (platform-infrastructure#1517): the
++              // verdict-policy prompt (relaxation must be reported) plus #1416's batch.
++              '883f745ef11395a9235308d7f770aee8690b39909ab1682516682db29d424379',
+             ]);
+             const changed = await github.paginate(github.rest.pulls.listFiles, {
+               ...context.repo,
+@@ -858,6 +882,17 @@ jobs:
+               /^[0-9a-f]{64}$/.test(runtimeRelease.agent_artifact_sha256 || '') &&
+               runtimeRelease.policy_digest === receipt?.policy_digest &&
+               runtimeRelease.receipt_schema_version === receipt?.schema_version;
++            const validOptionalTimestamp = (value) => value === null || (
++              typeof value === 'string' && Number.isFinite(Date.parse(value))
++            );
++            const producerLifecycle = receipt?.lifecycle_timing;
++            const producerLifecycleValid = producerLifecycle &&
++              typeof producerLifecycle === 'object' && !Array.isArray(producerLifecycle) &&
++              Object.keys(producerLifecycle).sort().join(',') ===
++                'claimed_at,enqueued_at,model_completed_at,model_reused,model_started_at,receipt_staged_at' &&
++              ['claimed_at', 'enqueued_at', 'model_completed_at', 'model_started_at', 'receipt_staged_at']
++                .every((key) => validOptionalTimestamp(producerLifecycle[key])) &&
++              typeof producerLifecycle.model_reused === 'boolean';
+             const reviewResultEnvelope = receipt &&
+               (receipt.result_kind === undefined || receipt.result_kind === 'review_result');
+             const contractValidExceptPolicyDigest = reviewResultEnvelope &&
+@@ -905,7 +940,9 @@ jobs:
+             // medium/low; v3 also blocks medium (fixed, not waived) and records
+             // only low. An unknown policy name fails closed. Identity, policy
+             // digest and complete coverage are still validated independently.
+-            const verdictPolicy = process.env.VERDICT_POLICY || 'severity-record-only/v2';
++            // The input default supplies v2 when a caller omits it; an explicit
++            // empty value is not a policy and fails closed like any other.
++            const verdictPolicy = process.env.VERDICT_POLICY ?? '';
+             const verdictPolicyValid =
+               verdictPolicy === 'severity-record-only/v2' || verdictPolicy === 'finding-disposition/v3';
+             const blockingSeverities = verdictPolicy === 'finding-disposition/v3'
+@@ -1097,6 +1134,7 @@ jobs:
+               receipt?.attempt?.last_failure_retryable === true ||
+               ['request_not_claimed', 'result_missing_or_malformed'].includes(reason)
+             );
++            const receiptPublishedAt = new Date().toISOString();
+             let output = valid ? {
+               ...receipt,
+               result_kind: 'review_result',
+@@ -1127,6 +1165,9 @@ jobs:
+             };
+             output = {
+               ...output,
++              lifecycle_timing: producerLifecycleValid
++                ? { ...producerLifecycle, receipt_published_at: receiptPublishedAt }
++                : null,
+               trusted_binding: {
+                 schema: 'ai-review-head-binding/v1',
+                 repository: `${context.repo.owner}/${context.repo.repo}`,
+@@ -1290,7 +1331,7 @@ jobs:
+               check_run_id: Number(process.env.HEAD_CHECK_RUN_ID),
+               status: 'completed',
+               conclusion,
+-              completed_at: new Date().toISOString(),
++              completed_at: receiptPublishedAt,
+               output: findingAnnotations.length > 0
+                 ? { ...checkOutput, annotations: findingAnnotations }
+                 : checkOutput,
