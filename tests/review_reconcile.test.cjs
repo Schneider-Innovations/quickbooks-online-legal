@@ -77,16 +77,27 @@ async function scenario(options = {}) {
       created_at: requestTime },
     readyEvent,
   ] : [readyEvent];
+  let prReads = 0;
   const checksList = async () => {};
   const issueEvents = async () => {};
   const github = {
     paginate: async (method, args) => method === checksList
       ? (args.ref === head ? headChecks : [marker]) : readyHistory,
     rest: {
-      pulls: { get: async () => ({ data: pr }) },
+      // closedAfter: the PR merges after that many reads (auto-merge racing this job).
+      pulls: { get: async () => {
+        prReads += 1;
+        const closed = options.closedAfter !== undefined && prReads > options.closedAfter;
+        return { data: closed ? { ...pr, state: 'closed', merged: true, labels: [] } : pr };
+      } },
       checks: { listForRef: checksList, update: async (args) => updates.push(args) },
       issues: { listEvents: issueEvents },
-      git: { getRef: async () => ({ data: { object: { sha: merge } } }) },
+      git: { getRef: async () => {
+        if (options.mergeRefGone) {
+          throw Object.assign(new Error('Not Found'), { status: 404 });
+        }
+        return { data: { object: { sha: merge } } };
+      } },
       repos: { getCommit: async () => ({ data: { parents: [{ sha: base }, { sha: head }],
         commit: { tree: { sha: tree } } } }) },
       actions: { getWorkflowRun: async ({ run_id }) => ({ data: {
@@ -139,5 +150,21 @@ async function scenario(options = {}) {
   const sameSecond = await scenario({ sameSecondRelabel: true });
   assert.deepEqual(sameSecond.failures, ['AI_REVIEW_RECONCILE_LABEL_EVENT_CHANGED']);
   assert.equal(sameSecond.updates.length, 0);
-  console.log('review reconciliation: prior marker accepted; later markers and re-label denied');
+
+  // #1505: a PR merged while reconcile runs is a no-op, not a failure.
+  const closedBefore = await scenario({ closedAfter: 0 });
+  assert.deepEqual(closedBefore.failures, []);
+  assert.equal(closedBefore.updates.length, 0);
+  const mergedAtFence = await scenario({ closedAfter: 1 });
+  assert.deepEqual(mergedAtFence.failures, []);
+  assert.equal(mergedAtFence.updates.length, 0);
+  const refRetired = await scenario({ closedAfter: 1, mergeRefGone: true });
+  assert.deepEqual(refRetired.failures, []);
+  assert.equal(refRetired.updates.length, 0);
+  // An open PR stays fail-closed on the same missing merge ref.
+  const openRefMissing = await scenario({ mergeRefGone: true });
+  assert.deepEqual(openRefMissing.failures, ['AI_REVIEW_RECONCILE_MERGE_REF_INVALID']);
+  assert.equal(openRefMissing.updates.length, 0);
+  console.log('review reconciliation: prior marker accepted; later markers and re-label denied;'
+    + ' merged-during-run is a no-op');
 })().catch((error) => { console.error(error); process.exitCode = 1; });
