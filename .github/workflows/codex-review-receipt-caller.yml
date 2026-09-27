@@ -405,6 +405,17 @@ jobs:
             const label = 'ready-for-final-review';
             const getPr = async () => (await github.rest.pulls.get({ owner, repo, pull_number: number })).data;
             const pr = await getPr();
+            // A PR merged or closed while this job runs has nothing left to reconcile:
+            // its merge ref is retired and the merge gate was already evaluated. Exit
+            // without writing any check. An open PR keeps every fence below fail-closed.
+            const failUnlessClosed = async (code) => {
+              const live = await getPr().catch(() => null);
+              if (live?.state === 'closed') {
+                core.notice(`AI_REVIEW_RECONCILE_PR_CLOSED_NOOP:${code}`);
+                return;
+              }
+              core.setFailed(code);
+            };
             const currentPr = (value) => value.state === 'open' && !value.draft &&
               value.base.ref === 'main' && value.head.repo?.full_name === `${owner}/${repo}` &&
               (value.labels || []).some((item) => item.name === label);
@@ -421,7 +432,7 @@ jobs:
               return;
             }
             if (!currentPr(pr)) {
-              core.setFailed('AI_REVIEW_RECONCILE_PR_NOT_CURRENT');
+              await failUnlessClosed('AI_REVIEW_RECONCILE_PR_NOT_CURRENT');
               return;
             }
             const head = pr.head.sha.toLowerCase();
@@ -452,22 +463,28 @@ jobs:
                 result?.head_sha?.toLowerCase() !== head || result?.base_sha?.toLowerCase() !== base ||
                 binding?.repository !== `${owner}/${repo}` || binding?.pr_number !== number ||
                 binding?.head_sha?.toLowerCase() !== head || binding?.base_sha?.toLowerCase() !== base) {
-              core.setFailed('AI_REVIEW_RECONCILE_RECEIPT_NOT_VERIFIED');
+              await failUnlessClosed('AI_REVIEW_RECONCILE_RECEIPT_NOT_VERIFIED');
               return;
             }
             const ref = `pull/${number}/merge`;
-            const merge = (await github.rest.git.getRef({ owner, repo, ref })).data.object?.sha?.toLowerCase();
+            const merge = await github.rest.git.getRef({ owner, repo, ref })
+              .then((response) => response.data.object?.sha?.toLowerCase(), () => null);
             if (!/^[0-9a-f]{40}$/.test(merge || '')) {
-              core.setFailed('AI_REVIEW_RECONCILE_MERGE_REF_INVALID');
+              await failUnlessClosed('AI_REVIEW_RECONCILE_MERGE_REF_INVALID');
               return;
             }
-            const commit = (await github.rest.repos.getCommit({ owner, repo, ref: merge })).data;
+            const commit = await github.rest.repos.getCommit({ owner, repo, ref: merge })
+              .then((response) => response.data, () => null);
+            if (!commit) {
+              await failUnlessClosed('AI_REVIEW_RECONCILE_MERGE_NOT_VERIFIED');
+              return;
+            }
             const parents = (commit.parents || []).map((item) => item.sha.toLowerCase());
             if (parents.length !== 2 || !parents.includes(base) || !parents.includes(head) ||
                 result.merge_sha?.toLowerCase() !== merge ||
                 binding.reviewed_merge_sha?.toLowerCase() !== merge ||
                 binding.merge_tree_sha?.toLowerCase() !== commit.commit.tree.sha.toLowerCase()) {
-              core.setFailed('AI_REVIEW_RECONCILE_MERGE_NOT_VERIFIED');
+              await failUnlessClosed('AI_REVIEW_RECONCILE_MERGE_NOT_VERIFIED');
               return;
             }
             const verdictId = `ai-review/verdict:${number}:${head}:${merge}:${context.runId}:head`;
@@ -478,7 +495,7 @@ jobs:
             const verdict = passed(headChecks, 'ai-review/verdict', verdictId);
             const execution = passed(headChecks, 'ai-review/execution', executionId);
             if (!verdict || !execution) {
-              core.setFailed('AI_REVIEW_RECONCILE_VERDICT_NOT_VERIFIED');
+              await failUnlessClosed('AI_REVIEW_RECONCILE_VERDICT_NOT_VERIFIED');
               return;
             }
             const prefix = `ai-review-invalidated:merge:${number}:${head}:${merge}:`;
@@ -499,14 +516,14 @@ jobs:
                 !['failure', 'action_required'].includes(marker.conclusion) ||
                 !['Final-head AI review required', 'Final-head AI review not requested']
                   .includes(marker.output?.title)) {
-              core.setFailed('AI_REVIEW_RECONCILE_MARKER_UNEXPECTED');
+              await failUnlessClosed('AI_REVIEW_RECONCILE_MARKER_UNEXPECTED');
               return;
             }
             const markerRunMatch = marker.external_id.match(
               new RegExp(`^ai-review-invalidated:merge:${number}:${head}:${merge}:([1-9][0-9]*)$`));
             const markerRunId = Number(markerRunMatch?.[1]);
             if (!Number.isSafeInteger(markerRunId)) {
-              core.setFailed('AI_REVIEW_RECONCILE_MARKER_RUN_INVALID');
+              await failUnlessClosed('AI_REVIEW_RECONCILE_MARKER_RUN_INVALID');
               return;
             }
             const [requestRunResponse, markerRunResponse] = await Promise.all([
@@ -527,7 +544,7 @@ jobs:
                 !Number.isFinite(requestTime) || !Number.isFinite(markerTime) ||
                 !Number.isFinite(markerRunTime) || markerRunTime > markerTime ||
                 markerTime >= requestTime) {
-              core.setFailed('AI_REVIEW_RECONCILE_MARKER_NOT_PRIOR_TO_REQUEST');
+              await failUnlessClosed('AI_REVIEW_RECONCILE_MARKER_NOT_PRIOR_TO_REQUEST');
               return;
             }
             const readyEvents = async () => (await github.paginate(github.rest.issues.listEvents,
@@ -543,11 +560,12 @@ jobs:
                 !Number.isFinite(labelTime) || markerTime >= labelTime ||
                 labelTime > requestTime ||
                 ready.filter((event) => Date.parse(event.created_at) === requestTime).length > 1) {
-              core.setFailed('AI_REVIEW_RECONCILE_LABEL_EVENT_CHANGED');
+              await failUnlessClosed('AI_REVIEW_RECONCILE_LABEL_EVENT_CHANGED');
               return;
             }
             const [freshPr, freshRef, freshHead, freshMerge] = await Promise.all([
-              getPr(), github.rest.git.getRef({ owner, repo, ref }), checksAt(head), checksAt(merge),
+              getPr(), github.rest.git.getRef({ owner, repo, ref }).catch(() => ({ data: {} })),
+              checksAt(head), checksAt(merge),
             ]);
             const freshReceipt = newest(freshHead, (check) =>
               check.name === 'ai-review/receipt' && check.app?.id === 15368);
@@ -567,7 +585,7 @@ jobs:
                 freshMarker?.output?.title !== marker.output?.title ||
                 freshMarker?.completed_at !== marker.completed_at ||
                 freshReady?.id !== latestReady.id) {
-              core.setFailed('AI_REVIEW_RECONCILE_FINAL_FENCE_CHANGED');
+              await failUnlessClosed('AI_REVIEW_RECONCILE_FINAL_FENCE_CHANGED');
               return;
             }
             await github.rest.checks.update({
