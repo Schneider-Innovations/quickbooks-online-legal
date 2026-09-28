@@ -46,7 +46,7 @@ jobs:
     steps:
       - env:
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.client_payload.pr_number || github.event.inputs.pr_number }}
-          REVIEW_WORKFLOW_REF: 17ca46f88005d6ed7785787492d3bde36e0da714 # pragma: allowlist secret
+          REVIEW_WORKFLOW_REF: c1b3428a255707b798429dd7d6d10b6787a482ae # pragma: allowlist secret
         id: admission
         name: Deduplicate active exact-head review requests
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
@@ -145,8 +145,8 @@ jobs:
       issues: read
       pull-requests: read
     steps:
-      - name: Ignore obsolete invalidation events
-        id: invalidation-current
+      - id: invalidation-current
+        name: Ignore obsolete invalidation events
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         with:
           retries: 0
@@ -171,29 +171,33 @@ jobs:
               const result = await github.graphql(`query($owner:String!,$repo:String!,$number:Int!) {
                 repository(owner:$owner,name:$repo) { pullRequest(number:$number) {
                   timelineItems(last:50,itemTypes:[LABELED_EVENT,UNLABELED_EVENT]) {
-                    nodes { __typename ... on LabeledEvent { createdAt label { name } }
+                    nodes { __typename ... on LabeledEvent { createdAt actor { login } label { name } }
                       ... on UnlabeledEvent { createdAt label { name } } }
                   }
                 } }
               }`, { ...context.repo, number: event.number });
               const nodes = result.repository.pullRequest.timelineItems.nodes;
-              const latest = [...nodes].reverse().find(node => node.label?.name === 'ready-for-final-review');
+              const readiness = nodes.filter(node => node.label?.name === 'ready-for-final-review');
+              const latest = readiness[readiness.length - 1];
               // Same-second timestamps cannot establish that this event precedes the new
               // label. Preserve the label and let exact-head receipt admission decide.
               const labelAt = Date.parse(latest?.createdAt || '');
               // A rejected labeled event must still revoke its own unauthorized/draft
-              // request. Only a strictly later label may supersede that event.
+              // request, but only when the latest label is provably that event: the only
+              // readiness label applied in that second, by this event's sender. Any other
+              // same-second label may be a newer reapplication; preserving it is safe
+              // because the review job admits only the protected requester on a ready PR.
+              const sender = (context.payload.sender?.login || '').toLowerCase();
+              const sameSecond = readiness.filter(node =>
+                node.__typename === 'LabeledEvent' && Date.parse(node.createdAt || '') === eventAt);
+              const ownLabel = action === 'labeled' && sender !== '' && sameSecond.length === 1 &&
+                (latest?.actor?.login || '').toLowerCase() === sender;
               if (latest?.__typename === 'LabeledEvent' &&
-                  (labelAt > eventAt || (labelAt === eventAt && action !== 'labeled'))) {
+                  (labelAt > eventAt || (labelAt === eventAt && !ownLabel))) {
                 core.setOutput('current', 'false');
                 core.notice('AI_REVIEW_NEWER_READINESS_LABEL_PRESERVED');
               }
             }
-      # Organization policy keeps GITHUB_TOKEN read-only. A dedicated review
-      # label App mints a token scoped to this repository and pull-requests
-      # write only; it is used only to remove a stale readiness label. No
-      # personal-account credential is involved, and no pull-request code is
-      # checked out or executed by this base-owned job.
       - name: Mint scoped review-label token
         if: (always()) && steps.invalidation-current.outputs.current == 'true'
         id: review-label-token
@@ -462,7 +466,7 @@ jobs:
             const result = parse(receipt);
             const binding = result?.trusted_binding;
             if (receipt?.status !== 'completed' || receipt.conclusion !== 'success' ||
-                result?.status !== 'completed' || result?.decision !== 'PASS' ||
+                result?.status !== 'completed' || !['PASS', 'BLOCK'].includes(result?.decision) ||
                 result?.analysis_complete !== true ||
                 result?.pr_number !== number ||
                 result?.head_sha?.toLowerCase() !== head || result?.base_sha?.toLowerCase() !== base ||
@@ -499,7 +503,13 @@ jobs:
               check.status === 'completed' && check.conclusion === 'success');
             const verdict = passed(headChecks, 'ai-review/verdict', verdictId);
             const execution = passed(headChecks, 'ai-review/execution', executionId);
-            if (!verdict || !execution) {
+            // The policy verdict, not the receipt's model vote (BLOCK whenever
+            // any finding exists), authorizes this; bind it to this receipt.
+            const policy = parse(verdict);
+            if (!verdict || !execution || policy?.status !== 'completed' ||
+                policy?.decision !== 'PASS' || policy?.review_decision !== result.decision ||
+                policy?.request_id !== result.request_id ||
+                Number(policy?.original_receipt_check_run_id) !== Number(receipt.id)) {
               await failUnlessClosed('AI_REVIEW_RECONCILE_VERDICT_NOT_VERIFIED');
               return;
             }

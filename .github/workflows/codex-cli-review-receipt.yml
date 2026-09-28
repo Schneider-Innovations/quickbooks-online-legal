@@ -42,6 +42,14 @@ on:
         required: false
         type: string
         default: severity-record-only/v2
+      review_policy_digests:
+        description: >-
+          Central policy-digest allowlist (comma-separated, sorted, unique
+          lowercase SHA-256). Honored only for the canonical protected-base
+          caller chain; empty keeps the embedded list.
+        required: false
+        type: string
+        default: ''
     # Every protected caller has one canonical, guarded secret mapping. Keep
     # the interface declaration so GitHub can validate the reusable call, but
     # never reference this secret in a job, environment, or bridge command.
@@ -79,6 +87,36 @@ jobs:
       request_id: ${{ steps.context.outputs.request_id }}
       head_check_run_id: ${{ steps.receipt.outputs.head_check_run_id }}
     steps:
+      # Every input of this reusable workflow (verdict policy, automation
+      # login, required label, PR number) is trusted only because the
+      # canonical caller on the protected default branch is itself reviewed
+      # and pin-verified. Any other caller (another path, a branch-dispatched
+      # or push-triggered workflow) could otherwise run a real review under a
+      # weaker policy and publish the required ai-review/* checks, so every
+      # job fails before it creates or updates any check.
+      - name: Authenticate canonical review caller
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CALLER_EVENT_NAME: ${{ github.event_name }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          CALLER_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+        with:
+          script: |
+            const isCanonicalCaller = () => {
+              const repository = process.env.CALLER_REPOSITORY || '';
+              const defaultBranch = process.env.CALLER_DEFAULT_BRANCH || '';
+              const expectedCaller =
+                `${repository}/.github/workflows/codex-review-receipt-caller.yml@refs/heads/${defaultBranch}`;
+              return repository !== '' &&
+                defaultBranch !== '' &&
+                process.env.BASE_BRANCH === defaultBranch &&
+                process.env.CALLER_WORKFLOW_REF === expectedCaller &&
+                ['pull_request_target', 'workflow_dispatch', 'repository_dispatch']
+                  .includes(process.env.CALLER_EVENT_NAME);
+            };
+            if (!isCanonicalCaller()) core.setFailed('AI_CLI_REVIEW_UNTRUSTED_CALLER');
       - id: context
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
@@ -87,8 +125,46 @@ jobs:
           REQUIRED_LABEL: ${{ inputs.required_label }}
           AUTOMATION_LOGIN: ${{ inputs.automation_login }}
           REVIEW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          REVIEW_POLICY_DIGESTS: ${{ inputs.review_policy_digests }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CALLER_EVENT_NAME: ${{ github.event_name }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          CALLER_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         with:
           script: |
+            const parseCentralPolicyDigests = () => {
+              // The platform-central caller passes its release-bound allowlist. Only the
+              // canonical caller stub on the repository's default (protected) branch may
+              // do so; every other caller keeps the embedded list below. The branch comes
+              // from GitHub's event payload, never from a caller input, so a workflow
+              // dispatched from any other branch cannot authorize its own allowlist. Any
+              // malformed value fails closed.
+              const raw = process.env.REVIEW_POLICY_DIGESTS || '';
+              if (raw === '') return null;
+              if (!/^[0-9a-f]{64}(,[0-9a-f]{64}){0,127}$/.test(raw)) throw new Error('AI_CLI_REVIEW_POLICY_DIGESTS_INVALID');
+              const list = raw.split(',');
+              if (new Set(list).size !== list.length || [...list].sort().join(',') !== raw) {
+                throw new Error('AI_CLI_REVIEW_POLICY_DIGESTS_INVALID');
+              }
+              const expectedCaller =
+                `${process.env.CALLER_REPOSITORY}/.github/workflows/codex-review-receipt-caller.yml@refs/heads/${process.env.CALLER_DEFAULT_BRANCH}`;
+              if (
+                !process.env.CALLER_REPOSITORY ||
+                !process.env.CALLER_DEFAULT_BRANCH ||
+                process.env.BASE_BRANCH !== process.env.CALLER_DEFAULT_BRANCH ||
+                process.env.CALLER_WORKFLOW_REF !== expectedCaller ||
+                !['pull_request_target', 'workflow_dispatch'].includes(process.env.CALLER_EVENT_NAME)
+              ) {
+                throw new Error('AI_CLI_REVIEW_POLICY_DIGESTS_UNTRUSTED_CALLER');
+              }
+              return new Set(list);
+            };
+            try {
+              parseCentralPolicyDigests();
+            } catch (error) {
+              core.setFailed(error.message);
+              return;
+            }
             const requestedPrNumber = Number(process.env.PR_NUMBER);
             const requiredLabel = process.env.REQUIRED_LABEL;
             const automationLogin = (process.env.AUTOMATION_LOGIN || '').toLowerCase();
@@ -359,7 +435,7 @@ jobs:
           # ``MERGE_SHA`` is a verified base/head merge preview. The model
           # receives the exact changes this strict-gate Check would merge and
           # a full snapshot of that resulting tree.
-          git diff --no-ext-diff --no-textconv --binary "$BASE_SHA" "$MERGE_SHA" -- > "$temporary/diff.patch"
+          git diff --no-ext-diff --no-textconv --no-renames --binary "$BASE_SHA" "$MERGE_SHA" -- > "$temporary/diff.patch"
           source_root="$temporary/source"
           mkdir -- "$source_root"
           # Do not use git archive: it honors export-ignore and could omit a
@@ -382,7 +458,7 @@ jobs:
             cd "$source_root"
             find . -type f -print0 | tar --create --no-recursion --verbatim-files-from --null --files-from=- --gzip --file="$temporary/source.tar.gz"
           )
-          git diff --no-ext-diff --no-textconv --name-only -z "$BASE_SHA" "$MERGE_SHA" -- > "$temporary/changed-files.z"
+          git diff --no-ext-diff --no-textconv --no-renames --name-only -z "$BASE_SHA" "$MERGE_SHA" -- > "$temporary/changed-files.z"
           # Node is supplied by the pinned GitHub actions. It avoids shell JSON
           # interpolation and binds the review contract to the exact diff.
           node - "$temporary/changed-files.z" "$temporary/request.json" <<'NODE'
@@ -599,6 +675,36 @@ jobs:
     # and workflow overhead without allowing an unbounded runner occupation.
     timeout-minutes: 45
     steps:
+      # Every input of this reusable workflow (verdict policy, automation
+      # login, required label, PR number) is trusted only because the
+      # canonical caller on the protected default branch is itself reviewed
+      # and pin-verified. Any other caller (another path, a branch-dispatched
+      # or push-triggered workflow) could otherwise run a real review under a
+      # weaker policy and publish the required ai-review/* checks, so every
+      # job fails before it creates or updates any check.
+      - name: Authenticate canonical review caller
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CALLER_EVENT_NAME: ${{ github.event_name }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          CALLER_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+        with:
+          script: |
+            const isCanonicalCaller = () => {
+              const repository = process.env.CALLER_REPOSITORY || '';
+              const defaultBranch = process.env.CALLER_DEFAULT_BRANCH || '';
+              const expectedCaller =
+                `${repository}/.github/workflows/codex-review-receipt-caller.yml@refs/heads/${defaultBranch}`;
+              return repository !== '' &&
+                defaultBranch !== '' &&
+                process.env.BASE_BRANCH === defaultBranch &&
+                process.env.CALLER_WORKFLOW_REF === expectedCaller &&
+                ['pull_request_target', 'workflow_dispatch', 'repository_dispatch']
+                  .includes(process.env.CALLER_EVENT_NAME);
+            };
+            if (!isCanonicalCaller()) core.setFailed('AI_CLI_REVIEW_UNTRUSTED_CALLER');
       - id: receipt
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
@@ -621,6 +727,11 @@ jobs:
           CALLED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
           CALLED_WORKFLOW_PATH: ${{ job.workflow_file_path }}
           CALLED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          REVIEW_POLICY_DIGESTS: ${{ inputs.review_policy_digests }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CALLER_EVENT_NAME: ${{ github.event_name }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          CALLER_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         with:
           script: |
             const fs = require('fs');
@@ -901,12 +1012,53 @@ jobs:
               // oversized plans and scale native review to 6 threads.
               'ab5e585c67588492581112d8e6e61e8672ad6f2dcbde8129b6376a0fb21151cf',
             ]);
+            const parseCentralPolicyDigests = () => {
+              // The platform-central caller passes its release-bound allowlist. Only the
+              // canonical caller stub on the repository's default (protected) branch may
+              // do so; every other caller keeps the embedded list below. The branch comes
+              // from GitHub's event payload, never from a caller input, so a workflow
+              // dispatched from any other branch cannot authorize its own allowlist. Any
+              // malformed value fails closed.
+              const raw = process.env.REVIEW_POLICY_DIGESTS || '';
+              if (raw === '') return null;
+              if (!/^[0-9a-f]{64}(,[0-9a-f]{64}){0,127}$/.test(raw)) throw new Error('AI_CLI_REVIEW_POLICY_DIGESTS_INVALID');
+              const list = raw.split(',');
+              if (new Set(list).size !== list.length || [...list].sort().join(',') !== raw) {
+                throw new Error('AI_CLI_REVIEW_POLICY_DIGESTS_INVALID');
+              }
+              const expectedCaller =
+                `${process.env.CALLER_REPOSITORY}/.github/workflows/codex-review-receipt-caller.yml@refs/heads/${process.env.CALLER_DEFAULT_BRANCH}`;
+              if (
+                !process.env.CALLER_REPOSITORY ||
+                !process.env.CALLER_DEFAULT_BRANCH ||
+                process.env.BASE_BRANCH !== process.env.CALLER_DEFAULT_BRANCH ||
+                process.env.CALLER_WORKFLOW_REF !== expectedCaller ||
+                !['pull_request_target', 'workflow_dispatch'].includes(process.env.CALLER_EVENT_NAME)
+              ) {
+                throw new Error('AI_CLI_REVIEW_POLICY_DIGESTS_UNTRUSTED_CALLER');
+              }
+              return new Set(list);
+            };
+            let effectivePolicyDigests;
+            try {
+              effectivePolicyDigests = parseCentralPolicyDigests() ?? allowedPolicyDigests;
+            } catch (error) {
+              core.setFailed(error.message);
+              return;
+            }
             const changed = await github.paginate(github.rest.pulls.listFiles, {
               ...context.repo,
               pull_number: Number(process.env.PR_NUMBER),
               per_page: 100,
             });
-            const expectedChangedFiles = changed.map((file) => file.filename).sort();
+            // The review input disables rename detection, so a renamed file is
+            // reviewed as a deletion of its old path plus an addition of its new
+            // path. GitHub lists only the new name; add the old one so a rename
+            // can never hide the removed source from the coverage contract.
+            const expectedChangedFiles = [...new Set(changed.flatMap((file) =>
+              file.status === 'renamed' && typeof file.previous_filename === 'string' && file.previous_filename
+                ? [file.filename, file.previous_filename]
+                : [file.filename]))].sort();
             const isStringArray = (value) => Array.isArray(value) && value.every((item) => typeof item === 'string' && item.length > 0 && item.length <= 512);
             const sameSortedStrings = (value, expected) => isStringArray(value) &&
               [...value].sort().every((item, index) => item === expected[index]) && value.length === expected.length;
@@ -990,7 +1142,7 @@ jobs:
             // Platform has deployed and read back the bound artifact.
             const parisCandidateActive = false;
             const policyDigestAllowed = contractValidExceptPolicyDigest && (
-              allowedPolicyDigests.has(receipt.policy_digest) ||
+              effectivePolicyDigests.has(receipt.policy_digest) ||
               (parisCandidateActive && receipt.policy_digest === parisCandidateDigest &&
                 `${context.repo.owner}/${context.repo.repo}` === 'Schneider-Innovations/Project-QR')
             );
@@ -1766,6 +1918,36 @@ jobs:
       labels: [self-hosted, code-review, cli-review, shadow-only]
     timeout-minutes: 3
     steps:
+      # Every input of this reusable workflow (verdict policy, automation
+      # login, required label, PR number) is trusted only because the
+      # canonical caller on the protected default branch is itself reviewed
+      # and pin-verified. Any other caller (another path, a branch-dispatched
+      # or push-triggered workflow) could otherwise run a real review under a
+      # weaker policy and publish the required ai-review/* checks, so every
+      # job fails before it creates or updates any check.
+      - name: Authenticate canonical review caller
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CALLER_EVENT_NAME: ${{ github.event_name }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          CALLER_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+        with:
+          script: |
+            const isCanonicalCaller = () => {
+              const repository = process.env.CALLER_REPOSITORY || '';
+              const defaultBranch = process.env.CALLER_DEFAULT_BRANCH || '';
+              const expectedCaller =
+                `${repository}/.github/workflows/codex-review-receipt-caller.yml@refs/heads/${defaultBranch}`;
+              return repository !== '' &&
+                defaultBranch !== '' &&
+                process.env.BASE_BRANCH === defaultBranch &&
+                process.env.CALLER_WORKFLOW_REF === expectedCaller &&
+                ['pull_request_target', 'workflow_dispatch', 'repository_dispatch']
+                  .includes(process.env.CALLER_EVENT_NAME);
+            };
+            if (!isCanonicalCaller()) core.setFailed('AI_CLI_REVIEW_UNTRUSTED_CALLER');
       - name: Mark consumer terminal after verifier scheduling
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
@@ -1864,6 +2046,36 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
+      # Every input of this reusable workflow (verdict policy, automation
+      # login, required label, PR number) is trusted only because the
+      # canonical caller on the protected default branch is itself reviewed
+      # and pin-verified. Any other caller (another path, a branch-dispatched
+      # or push-triggered workflow) could otherwise run a real review under a
+      # weaker policy and publish the required ai-review/* checks, so every
+      # job fails before it creates or updates any check.
+      - name: Authenticate canonical review caller
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CALLER_EVENT_NAME: ${{ github.event_name }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          CALLER_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+        with:
+          script: |
+            const isCanonicalCaller = () => {
+              const repository = process.env.CALLER_REPOSITORY || '';
+              const defaultBranch = process.env.CALLER_DEFAULT_BRANCH || '';
+              const expectedCaller =
+                `${repository}/.github/workflows/codex-review-receipt-caller.yml@refs/heads/${defaultBranch}`;
+              return repository !== '' &&
+                defaultBranch !== '' &&
+                process.env.BASE_BRANCH === defaultBranch &&
+                process.env.CALLER_WORKFLOW_REF === expectedCaller &&
+                ['pull_request_target', 'workflow_dispatch', 'repository_dispatch']
+                  .includes(process.env.CALLER_EVENT_NAME);
+            };
+            if (!isCanonicalCaller()) core.setFailed('AI_CLI_REVIEW_UNTRUSTED_CALLER');
       - name: End matching non-gating request contract
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
