@@ -195,6 +195,7 @@ jobs:
             let mergeSha;
             let mergeRefAttempts = 0;
             let lastMergeRefFailure = 'unknown';
+            let unmergeableReads = 0;
             for (let attempt = 1; attempt <= mergeRefMaxAttempts; attempt += 1) {
               mergeRefAttempts = attempt;
               try {
@@ -217,6 +218,22 @@ jobs:
                 ) {
                   core.setFailed(`AI_CLI_REVIEW_MERGE_REF_CONTEXT_CHANGED:attempt=${attempt}`);
                   return;
+                }
+                // GitHub does not rebuild the merge preview of a conflicting
+                // PR, so waiting cannot help: every such wait observed ended
+                // only after a new push. Stop once GitHub has reported the
+                // conflict on two consecutive reads (a single read may predate
+                // its recomputation), before holding the runner for the window.
+                // This only fails earlier; it never admits a review.
+                if (livePr.mergeable === false) {
+                  unmergeableReads += 1;
+                  if (unmergeableReads >= 2) {
+                    core.setFailed(`AI_CLI_REVIEW_PR_NOT_MERGEABLE:attempt=${attempt}:mergeable_state=${
+                      /^[a-z_]{1,32}$/.test(livePr.mergeable_state || '') ? livePr.mergeable_state : 'unknown'}`);
+                    return;
+                  }
+                } else {
+                  unmergeableReads = 0;
                 }
                 const mergeRef = await github.rest.git.getRef({
                   owner,
@@ -639,6 +656,7 @@ jobs:
             let processingDeadline = null;
             let receipt = null;
             let resultPath = null;
+            let nextLiveBindingCheck = Date.now() + 60 * 1000;
             while (true) {
               resultPath = [readyPath, legacyPath].find((candidate) => fs.existsSync(candidate)) || null;
               if (resultPath) {
@@ -656,7 +674,47 @@ jobs:
               }
               const activeDeadline = processingDeadline ?? queueDeadline;
               if (now >= activeDeadline) break;
-              // Local filesystem checks only; no GitHub API requests in this loop.
+              // A result for a head or base that is no longer live is always
+              // rejected by the binding check below, so waiting for it only
+              // spends model and runner time. Every two minutes, check the
+              // PR and protected base (two reads); on a change stop waiting.
+              // The binding check then fails this job and the terminal step
+              // withdraws the request through the existing cancel path. An
+              // unreadable API state keeps waiting: this is only an early
+              // exit, and every verdict is still bound by the check below.
+              if (now >= nextLiveBindingCheck) {
+                nextLiveBindingCheck = now + 120 * 1000;
+                try {
+                  // Each read is bounded so a stalled request cannot consume
+                  // the wait budget; an aborted read is an unreadable state.
+                  const livePr = (await github.rest.pulls.get({
+                    ...context.repo, pull_number: Number(process.env.PR_NUMBER),
+                    request: { signal: AbortSignal.timeout(10 * 1000) },
+                  })).data;
+                  const liveBase = (await github.rest.git.getRef({
+                    ...context.repo, ref: `heads/${process.env.BASE_BRANCH || 'main'}`,
+                    request: { signal: AbortSignal.timeout(10 * 1000) },
+                  })).data.object?.sha?.toLowerCase();
+                  const liveHead = livePr.head?.sha?.toLowerCase();
+                  // Only a well-formed observation may withdraw a request; a
+                  // missing or malformed value is an ambiguous read and waits.
+                  const readable = typeof livePr.state === 'string' && typeof livePr.draft === 'boolean' &&
+                    /^[0-9a-f]{40}$/.test(liveHead || '') && /^[0-9a-f]{40}$/.test(liveBase || '') &&
+                    /^[0-9a-f]{40}$/.test(process.env.HEAD_SHA || '') &&
+                    /^[0-9a-f]{40}$/.test(process.env.BASE_SHA || '');
+                  if (!readable) {
+                    core.info('AI_CLI_REVIEW_LIVE_BINDING_UNREADABLE:malformed');
+                  } else if (livePr.state !== 'open' || livePr.draft === true ||
+                      liveHead !== process.env.HEAD_SHA || liveBase !== process.env.BASE_SHA) {
+                    core.setOutput('superseded', 'true');
+                    core.notice('AI_CLI_REVIEW_SUPERSEDED_WHILE_WAITING');
+                    break;
+                  }
+                } catch (error) {
+                  core.info(`AI_CLI_REVIEW_LIVE_BINDING_UNREADABLE:${error?.status || 'unknown'}`);
+                }
+              }
+              // Between live checks, only local filesystem checks.
               await new Promise((resolve) => setTimeout(resolve, Math.min(1000, activeDeadline - now)));
             }
             const expectedHead = process.env.HEAD_SHA;
@@ -839,6 +897,9 @@ jobs:
               // Release 83 Agent bundle (platform-infrastructure#1517): the
               // verdict-policy prompt (relaxation must be reported) plus #1416's batch.
               '883f745ef11395a9235308d7f770aee8690b39909ab1682516682db29d424379',
+              // Release 85 Agent candidate (platform-infrastructure#1577): fail fast on
+              // oversized plans and scale native review to 6 threads.
+              'ab5e585c67588492581112d8e6e61e8672ad6f2dcbde8129b6376a0fb21151cf',
             ]);
             const changed = await github.paginate(github.rest.pulls.listFiles, {
               ...context.repo,
@@ -1051,6 +1112,10 @@ jobs:
               'full_coverage_source_lines',
               'full_coverage_diff_bytes',
               'full_coverage_diff_lines',
+              // Release 85: the Review Agent fails fast before any model starts
+              // when the planned review exceeds MAX_REVIEW_PLAN_BATCHES. For this
+              // stage only, actual_bytes/limit_bytes count review batches.
+              'review_plan_batches',
             ]);
             const contextFailureSupplied = receipt && Object.hasOwn(receipt, 'failure');
             const suppliedContextFailure = receipt?.reason_code === 'review_context_too_large' &&
@@ -1065,7 +1130,9 @@ jobs:
                   failure_stage: receipt.failure.failure_stage,
                   actual_bytes: receipt.failure.actual_bytes,
                   limit_bytes: receipt.failure.limit_bytes,
-                  unit: receipt.failure.failure_stage.endsWith('_lines') ? 'lines' : 'bytes',
+                  unit: receipt.failure.failure_stage === 'review_plan_batches'
+                    ? 'batches'
+                    : receipt.failure.failure_stage.endsWith('_lines') ? 'lines' : 'bytes',
                 }
               : null;
             const suppliedContextFailureValid = !contextFailureSupplied || suppliedContextFailure !== null;
@@ -1205,7 +1272,10 @@ jobs:
             // stable machine protocol and must never substitute for a missing
             // or failed CLI receipt.
             const contextFailureSummary = suppliedContextFailure
-              ? suppliedContextFailure.unit === 'lines'
+              ? suppliedContextFailure.unit === 'batches'
+                ? `Review too large: ${suppliedContextFailure.actual_bytes} review batches planned, ` +
+                  `limit ${suppliedContextFailure.limit_bytes}. Split the PR into smaller PRs.`
+                : suppliedContextFailure.unit === 'lines'
                 ? `Review input exceeded ${suppliedContextFailure.failure_stage}: ` +
                   `${suppliedContextFailure.actual_bytes} lines supplied, ` +
                   `${suppliedContextFailure.limit_bytes} lines allowed.`
@@ -1251,6 +1321,8 @@ jobs:
             const checkOutput = {
               title: conclusion === 'success'
                 ? 'Codex CLI reviewed current head'
+                : suppliedContextFailure?.unit === 'batches'
+                  ? 'Codex CLI review too large: split the PR into smaller PRs'
                 : suppliedContextFailure
                   ? 'Codex CLI review context exceeds configured limit'
                   : 'Codex CLI review receipt not ready',
@@ -1594,6 +1666,7 @@ jobs:
           CANCEL_SUBJECT_DIGEST: ${{ needs.prepare-cli-review.outputs.cancel_subject_digest }}
           CANCEL_ATTEMPT_NUMBER: ${{ needs.prepare-cli-review.outputs.cancel_attempt_number }}
           PRODUCER_RECEIPT_OBSERVED: ${{ steps.receipt.outputs.producer_receipt_observed }}
+          SUPERSEDED: ${{ steps.receipt.outputs.superseded }}
         with:
           script: |
             const fs = require('fs');
@@ -1618,7 +1691,9 @@ jobs:
               const sequence = 1;
               const command = {
                 schema_version: '2.0', request_id: requestId, cancel_sequence: sequence,
-                reason: 'expired', created_at: new Date().toISOString(),
+                // superseded: the live head or base moved while waiting.
+                reason: process.env.SUPERSEDED === 'true' ? 'superseded' : 'expired',
+                created_at: new Date().toISOString(),
                 subject_digest: digest, lease_generation: 1, attempt_number: attempt,
               };
               const target = path.join(cancelIncoming, `${requestId}.${sequence}.json`);
