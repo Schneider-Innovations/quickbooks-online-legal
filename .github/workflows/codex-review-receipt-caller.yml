@@ -371,6 +371,11 @@ jobs:
       # caller's protected-base authorization check. The value is a repository
       # variable, not a credential, and is passed only as an immutable input.
       automation_login: ${{ vars.AI_REVIEW_REQUESTER_LOGIN || 'mercury1231' }}
+      # The local review workflow (QG 27cf403 mirror) binds its request and
+      # receipt to this exact caller run attempt and rejects an empty value.
+      # This caller admits requests without a scheduling Check, so the run
+      # identity recorded by admit-review-request is the generation.
+      request_generation: ${{ format('{0}:{1}', github.run_id, github.run_attempt) }}
     secrets:
       codex_trigger_token: ${{ secrets.CODEX_REVIEW_TRIGGER_TOKEN }}
 
