@@ -80,6 +80,7 @@ jobs:
       merge_tree_sha: ${{ steps.context.outputs.merge_tree_sha }}
       merge_ref_attempts: ${{ steps.context.outputs.merge_ref_attempts }}
       merge_ref_wait_ms: ${{ steps.context.outputs.merge_ref_wait_ms }}
+      prepare_failure: ${{ steps.context.outputs.prepare_failure }}
       merge_base_sha: ${{ steps.input.outputs.merge_base_sha }}
       cancel_subject_digest: ${{ steps.input.outputs.cancel_subject_digest }}
       cancel_attempt_number: ${{ steps.input.outputs.cancel_attempt_number }}
@@ -331,7 +332,11 @@ jobs:
                 const mergeTreeSha = mergeCommit.data.commit?.tree?.sha?.toLowerCase();
                 if (parents.length !== 2 || parents[0] !== liveBaseSha || parents[1] !== headSha) {
                   const error = new Error('synthetic merge ref parents did not match the live PR');
-                  error.code = 'MERGE_REF_PARENTS_INVALID';
+                  // The exact head on an older base means GitHub has not yet
+                  // rebuilt the preview after the base advanced.
+                  error.code = parents.length === 2 && parents[1] === headSha
+                    ? 'MERGE_REF_BASE_STALE'
+                    : 'MERGE_REF_PARENTS_INVALID';
                   throw error;
                 }
                 if (!/^[0-9a-f]{40}$/.test(mergeTreeSha || '')) {
@@ -368,6 +373,16 @@ jobs:
             }
             const mergeRefWaitMilliseconds = Date.now() - mergeRefStartedAt;
             if (!mergeSha) {
+              // GitHub sometimes never rebuilds a stale preview on its own:
+              // relabeling repeats this failure, and only a new head commit
+              // (updating the branch from the base) forces a rebuild. Name that
+              // case so the finalizer can tell the author what to do. The gate
+              // stays fail-closed either way.
+              if (lastMergeRefFailure.endsWith(':code=MERGE_REF_BASE_STALE')) {
+                core.setOutput('prepare_failure', 'merge_preview_stale_base');
+                core.setFailed(`AI_CLI_REVIEW_MERGE_REF_STALE_BASE:attempts=${mergeRefAttempts}:wait_ms=${mergeRefWaitMilliseconds}:${lastMergeRefFailure}`);
+                return;
+              }
               core.setFailed(`AI_CLI_REVIEW_MERGE_REF_UNAVAILABLE:attempts=${mergeRefAttempts}:wait_ms=${mergeRefWaitMilliseconds}:${lastMergeRefFailure}`);
               return;
             }
@@ -519,7 +534,28 @@ jobs:
           # script has another chance to re-query the fixed identity. A
           # transport error therefore fails closed; a new protected-main
           # dispatch re-runs the lookup before it can create anything.
+          # The script retries a transient failure itself instead, and only
+          # where a retry cannot duplicate a Check: the read, the update of a
+          # known Check, and a create whose exact generation external_id is
+          # looked up again before it is attempted a second time.
           script: |
+            // Without this, one dropped connection (HttpError "fetch failed")
+            // left the PR at "Review not started" until someone relabeled it.
+            const transientBackoffMilliseconds = [2_000, 5_000, 10_000];
+            const isTransient = (error) => !error?.response ||
+              [500, 502, 503, 504].includes(Number(error?.status));
+            const withTransientRetry = async (operation, label) => {
+              for (let attempt = 0; ; attempt += 1) {
+                try {
+                  return await operation(attempt);
+                } catch (error) {
+                  if (attempt >= transientBackoffMilliseconds.length || !isTransient(error)) throw error;
+                  core.notice(`AI_CLI_REVIEW_RECEIPT_TRANSIENT_RETRY:${label}:attempt=${attempt + 1}:status=${
+                    Number.isInteger(error?.status) ? error.status : 'unknown'}`);
+                  await new Promise((resolve) => setTimeout(resolve, transientBackoffMilliseconds[attempt]));
+                }
+              }
+            };
             const output = {
               title: 'Codex CLI review pending',
               summary: `Shadow CLI review requested for ${process.env.HEAD_SHA}; receipt binds reviewed merge ${process.env.MERGE_SHA}.`,
@@ -533,10 +569,11 @@ jobs:
               }, null, 2),
             };
             const headExternalId = `ai-cli-review:${process.env.PR_NUMBER}:${process.env.HEAD_SHA}`;
-            const existingChecks = await github.paginate(
+            const listHeadChecks = () => github.paginate(
               github.rest.checks.listForRef,
               { ...context.repo, ref: process.env.HEAD_SHA, per_page: 100, filter: 'all' },
             );
+            const existingChecks = await withTransientRetry(listHeadChecks, 'list');
             const newestActiveGeneration = (checks, prefixes) => checks
               .filter((check) =>
                 check.name === 'ai-review/receipt' &&
@@ -557,21 +594,31 @@ jobs:
             const generationStartedAt = Date.now();
             const headGenerationExternalId = `${headExternalId}:run:${context.runId}:${generationStartedAt}`;
             const headCheck = reusableHead
-              ? await github.rest.checks.update({
+              ? await withTransientRetry(() => github.rest.checks.update({
                   ...context.repo,
                    check_run_id: reusableHead.id,
                    status: 'in_progress',
                    external_id: headGenerationExternalId,
                    output,
-                })
-              : await github.rest.checks.create({
-                  ...context.repo,
-                  name: 'ai-review/receipt',
-                  head_sha: process.env.HEAD_SHA,
-                  status: 'in_progress',
-                  external_id: headGenerationExternalId,
-                  output,
-                });
+                }), 'update')
+              : await withTransientRetry(async (attempt) => {
+                  // An ambiguous create may have succeeded: adopt that exact
+                  // generation instead of creating a second one.
+                  if (attempt > 0) {
+                    const created = (await listHeadChecks()).find((check) =>
+                      check.name === 'ai-review/receipt' &&
+                      check.external_id === headGenerationExternalId);
+                    if (created) return { data: created };
+                  }
+                  return github.rest.checks.create({
+                    ...context.repo,
+                    name: 'ai-review/receipt',
+                    head_sha: process.env.HEAD_SHA,
+                    status: 'in_progress',
+                    external_id: headGenerationExternalId,
+                    output,
+                  });
+                }, 'create');
             core.setOutput('head_check_run_id', String(headCheck.data.id));
 
       - name: Remove submitted snapshot after failed preparation
@@ -1460,9 +1507,15 @@ jobs:
             const publicCause = transportOmissions > 0
               ? `${transportOmissions} file(s) could not be reviewed because unit context was transport-truncated. `
               : '';
+            // The producer lists at most 32 batches and only counts the rest.
+            const omittedBatches = validDiagnostic &&
+              Number.isSafeInteger(diagnostic.omitted_inconclusive_batch_count) &&
+              diagnostic.omitted_inconclusive_batch_count > 0
+              ? diagnostic.omitted_inconclusive_batch_count : 0;
             const inconclusiveExplanation = output.decision === 'INCONCLUSIVE'
               ? validDiagnostic
-                ? `${diagnostic.inconclusive_batches.length} bounded batch(es) returned INCONCLUSIVE; ` +
+                ? `${diagnostic.inconclusive_batches.length + omittedBatches} bounded batch(es) returned INCONCLUSIVE` +
+                  (omittedBatches > 0 ? ` (${omittedBatches} not listed in the bounded diagnostic)` : '') + '; ' +
                   `${diagnostic.final_review.mode} ended ${diagnostic.final_review.outcome}. ` +
                   publicCause + 'Inspect the original receipt for bounded diagnostics and any final-review skip reason.'
                 : 'explanation_unavailable: the producer supplied no valid public diagnostic.'
@@ -2090,6 +2143,7 @@ jobs:
           BASE_BRANCH: ${{ inputs.base_branch }}
           REQUIRED_LABEL: ${{ inputs.required_label }}
           PREPARE_RESULT: ${{ needs.prepare-cli-review.result }}
+          PREPARE_FAILURE: ${{ needs.prepare-cli-review.outputs.prepare_failure }}
           RECEIPT_RESULT: ${{ needs.await-cli-review.outputs.receipt_step_outcome || needs.await-cli-review.result }}
         with:
           retries: 3
@@ -2225,6 +2279,17 @@ jobs:
             let outcome = 'UNAVAILABLE';
             let nextAction = 'restore_service';
             let policyDigest = null;
+            // A preview GitHub never rebuilt needs the author, not the operator:
+            // ARCP v2 pairs merge_preview_stale with update_branch. The
+            // lifecycle stays a fail-closed terminal UNAVAILABLE.
+            const stalePreview = prepareResult === 'failure' &&
+              process.env.PREPARE_FAILURE === 'merge_preview_stale_base';
+            if (stalePreview) {
+              reasonCode = 'merge_preview_stale';
+              nextAction = 'update_branch';
+            }
+            const baseBranch = process.env.BASE_BRANCH || 'main';
+            const requiredLabel = process.env.REQUIRED_LABEL || 'ready-for-final-review';
             if (headCheckId && /^[0-9a-f]{40}$/.test(mergeSha) && /^[0-9a-f]{40}$/.test(mergeTreeSha)) {
               const headReceipt = await github.rest.checks.get({
                 ...context.repo, check_run_id: headCheckId,
@@ -2458,7 +2523,9 @@ jobs:
                     ? 'Inspect and resolve the blocking review findings before requesting a new review.'
                     : phase === 'INCONCLUSIVE'
                       ? 'Investigate the inconclusive review evidence and request a fresh review.'
-                      : 'Restore the trusted review gate, then request a fresh exact-head review.',
+                      : stalePreview
+                        ? `GitHub did not rebuild this pull request's merge preview after ${baseBranch} advanced, so the review never started. Relabeling repeats this failure: update the branch from ${baseBranch}, then apply ${requiredLabel} again.`
+                        : 'Restore the trusted review gate, then request a fresh exact-head review.',
               },
             };
             if (requestCheck.status === 'completed' && phase !== 'APPROVED') {
@@ -2478,7 +2545,9 @@ jobs:
                     ? 'AI review completed with blocking findings'
                     : phase === 'INCONCLUSIVE'
                       ? 'AI review completed without a conclusive decision'
-                      : 'AI review lifecycle unavailable',
+                      : stalePreview
+                        ? `AI review not started: update the branch from ${baseBranch}`
+                        : 'AI review lifecycle unavailable',
                 summary: 'The scheduling contract is terminal. ai-review/receipt remains the sole review verdict.',
                 text: `\`\`\`json\n${JSON.stringify(request)}\n\`\`\``,
               },
