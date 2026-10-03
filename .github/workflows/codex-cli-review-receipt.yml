@@ -1058,6 +1058,9 @@ jobs:
               // Release 85 Agent candidate (platform-infrastructure#1577): fail fast on
               // oversized plans and scale native review to 6 threads.
               'ab5e585c67588492581112d8e6e61e8672ad6f2dcbde8129b6376a0fb21151cf',
+              // Release 101b Agent candidate (platform-infrastructure#1990):
+              // Agent ad9ea8685674cabec8efed99ab16b9f9c3f42cb9c6987d5a6d7839f2e3c049fb.
+              '98a3ac85b784c9cbdb72a7d9a80c045843765d201d5302641913cfc85e4c1b5b',
             ]);
             const parseCentralPolicyDigests = () => {
               // The platform-central caller passes its release-bound allowlist. Only the
