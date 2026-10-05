@@ -56,6 +56,20 @@ on:
     secrets:
       codex_trigger_token:
         required: false
+    # snd-quality-gate#357: set only for the first full-coverage INCONCLUSIVE
+    # on a head, after its durable record reads back. This workflow holds no
+    # label credential; a caller that holds the labeler App re-applies the
+    # readiness label once, after re-checking the live head and label.
+    outputs:
+      auto_rerequest:
+        description: '"eligible" when the caller may re-request this head once; otherwise empty.'
+        value: ${{ jobs.finalize-review-request.outputs.auto_rerequest }}
+      auto_rerequest_head_sha:
+        description: Exact head SHA the automatic re-request is bound to.
+        value: ${{ jobs.finalize-review-request.outputs.auto_rerequest_head_sha }}
+      auto_rerequest_request_check_id:
+        description: ai-review/request Check that records the single automatic attempt.
+        value: ${{ jobs.finalize-review-request.outputs.auto_rerequest_request_check_id }}
 
 # This workflow is only called by the base-owned pull_request_target caller in
 # this repository. It checks out a same-repository PR snapshot but never runs
@@ -82,6 +96,8 @@ jobs:
       merge_ref_wait_ms: ${{ steps.context.outputs.merge_ref_wait_ms }}
       prepare_failure: ${{ steps.context.outputs.prepare_failure }}
       merge_base_sha: ${{ steps.input.outputs.merge_base_sha }}
+      referenced_context_r2: ${{ steps.input.outputs.referenced_context_r2 }}
+      digest_checks: ${{ steps.input.outputs.digest_checks }}
       cancel_subject_digest: ${{ steps.input.outputs.cancel_subject_digest }}
       cancel_attempt_number: ${{ steps.input.outputs.cancel_attempt_number }}
       pr_number: ${{ steps.context.outputs.pr_number }}
@@ -511,6 +527,328 @@ jobs:
               attempt_number: cancelAttemptNumber,
             },
           };
+          // BEGIN R2 REFERENCED CONTEXT
+          // snd-quality-gate#358 source R2: a changed workflow or composite action
+          // that pins this same repository's workflow or action at a 40-hex commit.
+          // The bytes come from this checkout's local history (no token, no network)
+          // and only from commits already reachable from the protected base. They
+          // travel inside request.json because the claim broker copies only three
+          // files. Read-only context; never executed and never a review target.
+          function buildReferencedContextR2({ changedFiles, repository, baseSha, requestBytes, git }) {
+            const FILE_BYTES = 16 * 1024;
+            const TOTAL_BYTES = 64 * 1024;
+            const REQUEST_LIMIT = 120 * 1024;
+            const MAX_SUPPLIED = 16;
+            const MAX_ENTRIES = 32;
+            const RECEIPT_METADATA_BYTES = 12 * 1024;
+            const crypto = require('crypto');
+            const changed = new Set(changedFiles);
+            const isReferenceSource = (file) => /^\.github\/workflows\/[^/]+\.ya?ml$/.test(file) ||
+              /^\.github\/actions\/(?:[^/]+\/)*action\.ya?ml$/.test(file);
+            const safePath = (value) => typeof value === 'string' && value.length > 0 && value.length <= 512 &&
+              !value.startsWith('/') && !value.split('/').some((part) => part === '' || part === '.' || part === '..');
+            const tryGit = (args) => {
+              try { return git(args); } catch { return null; }
+            };
+            // Mode, type and blob of one path in a commit, read from git objects only.
+            // Memoized: many changed workflows can repeat the same reference.
+            const treeEntries = new Map();
+            const treeEntry = (commit, file) => {
+              const key = `${commit}\0${file}`;
+              if (treeEntries.has(key)) return treeEntries.get(key);
+              const raw = tryGit(['ls-tree', '-z', '--full-tree', commit, '--', file]);
+              const line = raw?.toString('utf8').split('\0').find((item) => item.endsWith(`\t${file}`));
+              const match = line?.match(/^(\d{6}) (\w+) ([0-9a-f]{40})\t/);
+              const result = match ? { mode: match[1], type: match[2], blob: match[3] } : null;
+              treeEntries.set(key, result);
+              return result;
+            };
+            const candidates = new Map();
+            for (const file of [...changed].filter(isReferenceSource).sort()) {
+              const source = treeEntry('HEAD', file);
+              if (!source || source.type !== 'blob' || !['100644', '100755'].includes(source.mode)) continue;
+              const text = tryGit(['cat-file', 'blob', source.blob]);
+              if (text === null) continue;
+              // u[s]es keeps this script from reading as a workflow action reference
+              // to scanners that match the literal key in workflow text.
+              for (const match of text.toString('utf8').matchAll(/^\s*-?\s*u[s]es:\s*['"]?([^'"\s#]+)['"]?/gm)) {
+                const reference = match[1].match(/^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/([^@]+)@([0-9a-f]{40})$/);
+                if (!reference || reference[1].toLowerCase() !== repository.toLowerCase() || !safePath(reference[2])) continue;
+                const targets = /\.ya?ml$/.test(reference[2])
+                  ? [reference[2]] : [`${reference[2]}/action.yml`, `${reference[2]}/action.yaml`];
+                const commit = reference[3];
+                const resolved = targets.find((target) => treeEntry(commit, target)) ?? targets[0];
+                if (changed.has(resolved)) continue;
+                const key = `${resolved}\0${commit}`;
+                const entry = candidates.get(key) ?? { path: resolved, commit_sha: commit, referenced_by: new Set() };
+                entry.referenced_by.add(file);
+                candidates.set(key, entry);
+              }
+            }
+            const SCHEMA = 'ai-review-referenced-context-request/v1';
+            const entries = [];
+            const contents = new Map();
+            for (const key of [...candidates.keys()].sort().slice(0, MAX_ENTRIES)) {
+              const candidate = candidates.get(key);
+              const entry = {
+                path: candidate.path, commit_sha: candidate.commit_sha,
+                referenced_by: [...candidate.referenced_by].sort(),
+                blob_sha: null, sha256: null, bytes: null, supplied: false, reason: null,
+              };
+              entries.push(entry);
+              if (tryGit(['rev-parse', '--verify', '--quiet', `${candidate.commit_sha}^{commit}`]) === null) {
+                entry.reason = 'not_found';
+                continue;
+              }
+              const target = treeEntry(candidate.commit_sha, candidate.path);
+              if (!target) {
+                entry.reason = 'not_found';
+                continue;
+              }
+              if (target.type !== 'blob' || !['100644', '100755'].includes(target.mode)) {
+                entry.reason = 'not_regular_file';
+                continue;
+              }
+              const payload = tryGit(['cat-file', 'blob', target.blob]);
+              if (payload === null) {
+                entry.reason = 'not_found';
+                continue;
+              }
+              entry.blob_sha = target.blob;
+              entry.sha256 = crypto.createHash('sha256').update(payload).digest('hex');
+              entry.bytes = payload.length;
+              if (tryGit(['merge-base', '--is-ancestor', candidate.commit_sha, baseSha]) === null) {
+                entry.reason = 'not_on_protected_branch';
+                continue;
+              }
+              if (payload.length > FILE_BYTES) {
+                entry.reason = 'oversized';
+                continue;
+              }
+              let content;
+              try {
+                // ignoreBOM keeps a leading byte-order mark, so the content is
+                // byte-identical to the blob that bytes/sha256/blob_sha describe.
+                content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(payload);
+              } catch {
+                content = null;
+              }
+              if (content === null || content.includes('\0') || Buffer.byteLength(content, 'utf8') !== payload.length) {
+                entry.reason = 'not_text';
+                continue;
+              }
+              // Eligible: recorded as over budget until it is actually supplied
+              // below, so the metadata size counted next is an upper bound.
+              entry.reason = 'request_budget_exhausted';
+              contents.set(entry, content);
+            }
+            // The whole block, unsupplied metadata included, must keep
+            // request.json under REQUEST_LIMIT. The key and separator
+            // ("referenced_context_r2" plus punctuation) are covered by the slack.
+            // Every recorded entry must also come back in the receipt (the
+            // await job requires it), so the receipt form of the metadata is
+            // bounded too, well inside the 64 KiB receipt and the 60,000-char
+            // Check output, leaving room for findings and the other fields.
+            const KEY_SLACK = 64;
+            const blockBytes = () => Buffer.byteLength(JSON.stringify({ schema: SCHEMA, entries }), 'utf8');
+            const receiptBytes = () => entries.reduce((total, entry) => total + 1 +
+              Buffer.byteLength(JSON.stringify({ source: 'same_repo_pinned', ...entry }), 'utf8'), 0);
+            while (entries.length > 0 && (requestBytes + KEY_SLACK + blockBytes() > REQUEST_LIMIT ||
+              receiptBytes() > RECEIPT_METADATA_BYTES)) {
+              contents.delete(entries.pop());
+            }
+            if (entries.length === 0) return null;
+            let requestTotal = requestBytes + KEY_SLACK + blockBytes();
+            let used = 0;
+            let supplied = 0;
+            for (const entry of entries) {
+              if (!contents.has(entry)) continue;
+              const pending = Buffer.byteLength(JSON.stringify(entry), 'utf8');
+              const suppliedEntry = { ...entry, supplied: true, reason: null, content: contents.get(entry) };
+              const encoded = Buffer.byteLength(JSON.stringify(suppliedEntry), 'utf8');
+              if (supplied >= MAX_SUPPLIED || used + encoded + 1 > TOTAL_BYTES ||
+                requestTotal - pending + encoded > REQUEST_LIMIT) {
+                continue;
+              }
+              Object.assign(entry, { supplied: true, reason: null, content: suppliedEntry.content });
+              requestTotal += encoded - pending;
+              used += encoded + 1;
+              supplied += 1;
+            }
+            return { schema: SCHEMA, entries };
+          }
+          // END R2 REFERENCED CONTEXT
+          // BEGIN D1 DIGEST CHECKS
+          // snd-quality-gate#358 option D, verifier D1: a model cannot verify a hash,
+          // so digest entries that name a file in this repository are recomputed here
+          // from git objects (no token, no network). The base-owned table below, never
+          // a file in the PR, lists the manifests and how each entry is hashed. Only
+          // entries added or changed against the protected base, or whose unpinned
+          // source file changed, are checked. Anything
+          // that cannot be verified stays unverified, and the verifier then fails the
+          // receipt closed.
+          function buildDigestChecksD1({ changedFiles, repository, baseSha, headSha, git }) {
+            const MAX_CHECKS = 64;
+            const KINDS = [
+              { repository: 'Schneider-Innovations/platform-infrastructure',
+                path: 'docs/runbooks/native-integration-file-map.json', kind: 'native-integration-file-map/v1' },
+              { repository: 'Schneider-Innovations/platform-infrastructure',
+                path: 'config/ci-runners/runner-hook-digests.json', kind: 'runner-hook-digests/v1' },
+            ];
+            const crypto = require('crypto');
+            const tryGit = (args) => {
+              try { return git(args); } catch { return null; }
+            };
+            const treeEntry = (commit, file) => {
+              const raw = tryGit(['ls-tree', '-z', '--full-tree', commit, '--', file]);
+              if (raw === null) return undefined;
+              const line = raw.toString('utf8').split('\0').find((item) => item.endsWith(`\t${file}`));
+              const match = line?.match(/^(\d{6}) (\w+) ([0-9a-f]{40})\t/);
+              return match ? { mode: match[1], type: match[2], blob: match[3] } : raw.length === 0 ? null : undefined;
+            };
+            const readBlob = (commit, file) => {
+              const entry = treeEntry(commit, file);
+              if (!entry || entry.type !== 'blob' || !['100644', '100755'].includes(entry.mode)) return null;
+              return tryGit(['cat-file', 'blob', entry.blob]);
+            };
+            const readJson = (commit, file) => {
+              // Only a successful empty tree lookup proves that the manifest is absent.
+              if (treeEntry(commit, file) === null) return null;
+              const raw = readBlob(commit, file);
+              if (raw === null) return undefined;
+              try { return JSON.parse(raw.toString('utf8')) ?? undefined; } catch { return undefined; }
+            };
+            const safePath = (value) => typeof value === 'string' && value.length > 0 && value.length <= 512 &&
+              !value.startsWith('/') && !value.split('/').some((part) => part === '' || part === '.' || part === '..');
+            const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
+            const checks = [];
+            for (const spec of KINDS) {
+              if (spec.repository.toLowerCase() !== repository.toLowerCase()) continue;
+              const record = (subject, commit, claimed, actual, result, reason) => ({
+                manifest: spec.path, kind: spec.kind, subject, commit_sha: commit,
+                claimed_sha256: claimed, actual_sha256: actual, result, reason,
+              });
+              const head = readJson('HEAD', spec.path);
+              if (head === null) continue; // Deleted manifest: nothing is claimed any more.
+              if (head === undefined) {
+                checks.push(record(null, headSha, null, null, 'unverified', 'unparsable'));
+                continue;
+              }
+              if (!changedFiles.includes(spec.path)) {
+                const sourceChanged = spec.kind === 'native-integration-file-map/v1'
+                  ? Object.keys(head?.files ?? {}).some((name) => changedFiles.includes(name))
+                  : (Array.isArray(head?.reviewed_hooks) ? head.reviewed_hooks : []).some((hook) =>
+                    hook?.source_commit == null &&
+                    String(hook?.source_repository).toLowerCase() === repository.toLowerCase() &&
+                    changedFiles.includes(hook?.path));
+                if (!sourceChanged) continue;
+              }
+              const base = readJson(baseSha, spec.path) || null;
+              const pending = [];
+              if (spec.kind === 'native-integration-file-map/v1') {
+                if (head?.schema !== 'native-integration-file-map/v1' || !head.files || typeof head.files !== 'object' || Array.isArray(head.files)) {
+                  checks.push(record(null, headSha, null, null, 'unverified', 'unparsable'));
+                  continue;
+                }
+                for (const [name, row] of Object.entries(head.files).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+                  const prior = base?.files?.[name];
+                  if (!row || typeof row !== 'object' || Array.isArray(row) || !('sha256' in row || 'bytes' in row)) {
+                    if (Object.hasOwn(base?.files ?? {}, name) && JSON.stringify(prior) === JSON.stringify(row) && !changedFiles.includes(name)) continue;
+                    pending.push(() => record(safePath(name) ? name : null, headSha, null, null, 'unverified', 'unparsable'));
+                    continue;
+                  }
+                  if (prior && prior.sha256 === row.sha256 && prior.bytes === row.bytes && !changedFiles.includes(name)) continue;
+                  pending.push(() => {
+                    if (!safePath(name) || !/^[0-9a-f]{64}$/.test(row.sha256 || '') || !Number.isSafeInteger(row.bytes)) {
+                      return record(safePath(name) ? name : null, headSha, null, null, 'unverified', 'unparsable');
+                    }
+                    const raw = readBlob('HEAD', name);
+                    if (raw === null) return record(name, headSha, row.sha256, null, 'mismatch', 'not_found');
+                    // The generator hashes text with CRLF normalized to LF.
+                    const normalized = Buffer.from(raw.toString('latin1').replace(/\r\n/g, '\n'), 'latin1');
+                    const actual = sha256(normalized);
+                    return actual === row.sha256 && normalized.length === row.bytes
+                      ? record(name, headSha, row.sha256, actual, 'verified', null)
+                      : record(name, headSha, row.sha256, actual, 'mismatch', 'digest_differs');
+                  });
+                }
+              } else {
+                if (head?.schema_version !== 1 || !Array.isArray(head.reviewed_hooks)) {
+                  checks.push(record(null, headSha, null, null, 'unverified', 'unparsable'));
+                  continue;
+                }
+                const key = (hook) => JSON.stringify([hook?.source_repository, hook?.source_commit ?? null, hook?.path, hook?.sha256]);
+                const prior = new Set((Array.isArray(base?.reviewed_hooks) ? base.reviewed_hooks : []).map(key));
+                for (const hook of head.reviewed_hooks) {
+                  const sourceChanged = hook?.source_commit == null &&
+                    String(hook?.source_repository).toLowerCase() === repository.toLowerCase() &&
+                    changedFiles.includes(hook?.path);
+                  if (prior.has(key(hook)) && !sourceChanged) continue;
+                  pending.push(() => {
+                    const subject = safePath(hook?.path) ? hook.path : null;
+                    const claimed = /^[0-9a-f]{64}$/.test(hook?.sha256 || '') ? hook.sha256 : null;
+                    const pinned = hook?.source_commit ?? null;
+                    if (subject === null || claimed === null || (pinned !== null && !/^[0-9a-f]{40}$/.test(pinned))) {
+                      return record(subject, pinned ?? headSha, claimed, null, 'unverified', 'unparsable');
+                    }
+                    if (String(hook.source_repository).toLowerCase() !== repository.toLowerCase()) {
+                      // Another repository's bytes need a credential (option D2/R3).
+                      return record(subject, pinned, claimed, null, 'unverified', 'other_repository');
+                    }
+                    const commit = pinned ?? headSha;
+                    if (pinned !== null && tryGit(['merge-base', '--is-ancestor', pinned, baseSha]) === null) {
+                      return record(subject, commit, claimed, null, 'unverified', 'not_on_protected_branch');
+                    }
+                    const raw = readBlob(pinned ?? 'HEAD', subject);
+                    if (raw === null) return record(subject, commit, claimed, null, 'mismatch', 'not_found');
+                    const actual = sha256(raw);
+                    return actual === claimed
+                      ? record(subject, commit, claimed, actual, 'verified', null)
+                      : record(subject, commit, claimed, actual, 'mismatch', 'digest_differs');
+                  });
+                }
+              }
+              if (pending.length > MAX_CHECKS) {
+                checks.push(record(null, headSha, null, null, 'unverified', 'too_many_entries'));
+                continue;
+              }
+              checks.push(...pending.map((check) => check()));
+            }
+            if (checks.length > MAX_CHECKS) {
+              return { schema: 'ai-review-digest-checks/v1', checks: [
+                { manifest: null, kind: null, subject: null, commit_sha: headSha, claimed_sha256: null,
+                  actual_sha256: null, result: 'unverified', reason: 'too_many_entries' }] };
+            }
+            return checks.length === 0 ? null : { schema: 'ai-review-digest-checks/v1', checks };
+          }
+          // END D1 DIGEST CHECKS
+          const digestChecks = buildDigestChecksD1({
+            changedFiles,
+            repository: process.env.REPOSITORY,
+            baseSha: process.env.BASE_SHA,
+            headSha: process.env.MERGE_SHA,
+            git: (args) => require('child_process').execFileSync('git', args, {
+              maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+            }),
+          });
+          // The Agent shows the verified results to the model; the verifier
+          // enforces them. Added before R2 so R2 budgets the request after it.
+          if (digestChecks !== null) request.digest_checks = digestChecks;
+          fs.appendFileSync(process.env.GITHUB_OUTPUT,
+            `digest_checks=${JSON.stringify(digestChecks?.checks ?? [])}\n`);
+          const referencedContextR2 = buildReferencedContextR2({
+            changedFiles,
+            repository: process.env.REPOSITORY,
+            baseSha: process.env.BASE_SHA,
+            requestBytes: Buffer.byteLength(JSON.stringify(request), 'utf8'),
+            git: (args) => require('child_process').execFileSync('git', args, {
+              maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+            }),
+          });
+          if (referencedContextR2 !== null) request.referenced_context_r2 = referencedContextR2;
+          // The verifier matches every pinned receipt entry to this record.
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `referenced_context_r2=${JSON.stringify(
+            (referencedContextR2?.entries ?? []).map(({ content, ...metadata }) => metadata))}\n`);
           fs.writeFileSync(requestPath, `${JSON.stringify(request)}\n`, { mode: 0o640 });
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `cancel_subject_digest=${cancelSubjectDigest}\n`);
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `cancel_attempt_number=${cancelAttemptNumber}\n`);
@@ -761,6 +1099,8 @@ jobs:
           MERGE_TREE_SHA: ${{ needs.prepare-cli-review.outputs.merge_tree_sha }}
           BASE_SHA: ${{ needs.prepare-cli-review.outputs.base_sha }}
           MERGE_BASE_SHA: ${{ needs.prepare-cli-review.outputs.merge_base_sha }}
+          REFERENCED_CONTEXT_R2: ${{ needs.prepare-cli-review.outputs.referenced_context_r2 }}
+          DIGEST_CHECKS: ${{ needs.prepare-cli-review.outputs.digest_checks }}
           MERGE_REF_ATTEMPTS: ${{ needs.prepare-cli-review.outputs.merge_ref_attempts }}
           MERGE_REF_WAIT_MS: ${{ needs.prepare-cli-review.outputs.merge_ref_wait_ms }}
           PR_NUMBER: ${{ needs.prepare-cli-review.outputs.pr_number }}
@@ -1032,6 +1372,143 @@ jobs:
               typeof item.title === 'string' && item.title.length > 0 && item.title.length <= 240 &&
               typeof item.explanation === 'string' && item.explanation.length > 0 && item.explanation.length <= 2000,
             );
+            // snd-quality-gate#358 source R1: unchanged files from the reviewed
+            // merge tree that the Agent supplied as read-only context. They are
+            // never review targets. The block is optional (older Agents omit
+            // it) unless the prepare job requested pinned context; when present
+            // it must be well formed, bounded, disjoint from the changed files,
+            // and every supplied blob must be in the exact reviewed merge tree,
+            // or the receipt contract fails closed.
+            // Source R2 (same_repo_pinned) entries carry commit_sha and must
+            // match, field for field, the record the prepare job built from
+            // its local history and wrote into request.json. Every requested
+            // record must appear in the receipt.
+            const referencedContext = receipt?.referenced_context;
+            const referencedReasons = new Set(['oversized', 'not_text', 'budget_exhausted', 'unverified']);
+            let requestedR2 = null;
+            try {
+              const parsed = JSON.parse(process.env.REFERENCED_CONTEXT_R2 || '[]');
+              requestedR2 = Array.isArray(parsed) ? parsed : null;
+            } catch {
+              requestedR2 = null;
+            }
+            const requestedR2For = (entry) => (requestedR2 || []).find((item) =>
+              item?.path === entry.path && item?.commit_sha === entry.commit_sha);
+            const pinnedEntryValid = (entry) => {
+              const requested = requestedR2For(entry);
+              return Boolean(requested) &&
+                /^[0-9a-f]{40}$/.test(entry.commit_sha || '') &&
+                entry.blob_sha === requested.blob_sha && entry.sha256 === requested.sha256 &&
+                entry.bytes === requested.bytes &&
+                JSON.stringify(entry.referenced_by) === JSON.stringify(requested.referenced_by) &&
+                (entry.supplied
+                  ? requested.supplied === true
+                  : entry.reason === (requested.supplied === true ? 'budget_exhausted' : requested.reason));
+            };
+            const referencedEntryValid = (entry) => entry && typeof entry === 'object' && !Array.isArray(entry) &&
+              (entry.source === 'same_repo_pinned'
+                ? Object.keys(entry).sort().join(',') ===
+                    'blob_sha,bytes,commit_sha,path,reason,referenced_by,sha256,source,supplied' &&
+                  pinnedEntryValid(entry)
+                : Object.keys(entry).sort().join(',') ===
+                    'blob_sha,bytes,path,reason,referenced_by,sha256,source,supplied' &&
+                  entry.source === 'same_repo_merge_tree' &&
+                  /^[0-9a-f]{40}$/.test(entry.blob_sha || '') && /^[0-9a-f]{64}$/.test(entry.sha256 || '') &&
+                  Number.isSafeInteger(entry.bytes) && entry.bytes >= 0 &&
+                  (entry.supplied ? true : referencedReasons.has(entry.reason))) &&
+              typeof entry.path === 'string' && entry.path.length > 0 && entry.path.length <= 512 &&
+              !entry.path.startsWith('/') && !entry.path.split('/').some((part) => part === '' || part === '.' || part === '..') &&
+              !expectedChangedFiles.includes(entry.path) &&
+              isStringArray(entry.referenced_by) && entry.referenced_by.length > 0 &&
+              entry.referenced_by.every((path) => expectedChangedFiles.includes(path)) &&
+              typeof entry.supplied === 'boolean' &&
+              (!entry.supplied || (entry.reason === null && entry.bytes <= 16 * 1024));
+            const referencedKey = (entry) => `${entry.path}\0${entry.commit_sha || ''}`;
+            const referencedShapeValid = referencedContext === undefined || (
+              referencedContext && typeof referencedContext === 'object' && !Array.isArray(referencedContext) &&
+              Object.keys(referencedContext).sort().join(',') === 'commit_sha,entries,omitted_entry_count,schema' &&
+              referencedContext.schema === 'ai-review-referenced-context/v1' &&
+              referencedContext.commit_sha === expectedMerge &&
+              Array.isArray(referencedContext.entries) &&
+              referencedContext.entries.length > 0 && referencedContext.entries.length <= 64 &&
+              Number.isSafeInteger(referencedContext.omitted_entry_count) && referencedContext.omitted_entry_count >= 0 &&
+              referencedContext.entries.every(referencedEntryValid) &&
+              referencedContext.entries.every((entry, index, entries) =>
+                index === 0 || referencedKey(entries[index - 1]) < referencedKey(entry))
+            );
+            // Every entry the prepare job recorded must come back in the
+            // receipt: a receipt cannot drop requested pinned context by
+            // leaving it out, or by omitting the whole block.
+            const receiptPinnedKeys = new Set(referencedShapeValid && referencedContext
+              ? referencedContext.entries.filter((entry) => entry.source === 'same_repo_pinned').map(referencedKey)
+              : []);
+            const requestedR2Complete = requestedR2 !== null && requestedR2.every((item) =>
+              item && typeof item === 'object' && typeof item.path === 'string' &&
+              typeof item.commit_sha === 'string' && receiptPinnedKeys.has(referencedKey(item)));
+            let referencedContextValid = referencedShapeValid && requestedR2Complete;
+            // Pinned blobs were bound by the prepare job; only merge-tree
+            // blobs are checked against the reviewed merge tree here.
+            const suppliedReferences = referencedShapeValid && referencedContext
+              ? referencedContext.entries.filter((entry) => entry.supplied && entry.source === 'same_repo_merge_tree') : [];
+            if (suppliedReferences.length > 0) {
+              // Only regular files can be supplied: a symlink (mode 120000) or
+              // a submodule (160000) never counts. The claimed `bytes` must
+              // equal the real blob size and the 16 KiB bound applies to that
+              // real size. `sha256` stays Agent-attested (format only); the
+              // verified `blob_sha` binds the content.
+              const regularFileModes = new Set(['100644', '100755']);
+              const suppliedLimit = 16 * 1024;
+              const treeEntry = (item) => item && typeof item === 'object' && typeof item.path === 'string';
+              try {
+                const tree = (await github.rest.git.getTree({
+                  ...context.repo, tree_sha: expectedMergeTree, recursive: 'true',
+                })).data;
+                const recursiveEntries = new Map((tree.tree || []).filter(treeEntry)
+                  .map((item) => [item.path, item]));
+                // When the recursive tree is truncated, walk the non-recursive
+                // trees of the same merge tree one segment at a time. The
+                // Contents API cannot be used here: it reports an internal
+                // symlink as `type: file`, so it cannot prove a regular file.
+                const levels = new Map();
+                const readLevel = async (treeSha) => {
+                  if (!levels.has(treeSha)) {
+                    const data = (await github.rest.git.getTree({ ...context.repo, tree_sha: treeSha })).data;
+                    levels.set(treeSha, {
+                      truncated: data.truncated === true,
+                      entries: new Map((data.tree || []).filter(treeEntry).map((item) => [item.path, item])),
+                    });
+                  }
+                  return levels.get(treeSha);
+                };
+                const walkTree = async (path) => {
+                  const segments = path.split('/');
+                  let treeSha = expectedMergeTree;
+                  for (let index = 0; index < segments.length; index += 1) {
+                    const level = await readLevel(treeSha);
+                    const item = level.entries.get(segments[index]);
+                    if (item === undefined) return undefined;
+                    if (index === segments.length - 1) return item;
+                    if (item.type !== 'tree' || item.mode !== '040000' || !/^[0-9a-f]{40}$/.test(item.sha || '')) {
+                      return undefined;
+                    }
+                    treeSha = item.sha;
+                  }
+                  return undefined;
+                };
+                for (const entry of suppliedReferences) {
+                  let item = recursiveEntries.get(entry.path);
+                  if (item === undefined && tree.truncated) item = await walkTree(entry.path);
+                  if (!item || item.type !== 'blob' || !regularFileModes.has(item.mode) ||
+                    item.sha !== entry.blob_sha || !Number.isSafeInteger(item.size) ||
+                    item.size !== entry.bytes || item.size > suppliedLimit) {
+                    referencedContextValid = false;
+                  }
+                }
+              } catch (error) {
+                core.warning(`AI_CLI_REVIEW_REFERENCED_CONTEXT_UNVERIFIED:${error.status || 'unknown'}`);
+                referencedContextValid = false;
+              }
+            }
             const coverageComplete = receipt && sameSortedStrings(receipt.changed_files, expectedChangedFiles) &&
               sameSortedStrings(receipt.reviewed_files, expectedChangedFiles) &&
               Array.isArray(receipt.omitted_files) && receipt.omitted_files.length === 0;
@@ -1085,7 +1562,8 @@ jobs:
               Object.keys(receipt.runtime).length === 2 &&
               Object.hasOwn(receipt.runtime, 'harness') && Object.hasOwn(receipt.runtime, 'version') &&
               typeof receipt.runtime.harness === 'string' && receipt.runtime.harness.length > 0 &&
-              typeof receipt.runtime.version === 'string' && receipt.runtime.version.length > 0;
+              typeof receipt.runtime.version === 'string' && receipt.runtime.version.length > 0 &&
+              referencedContextValid;
             const callerContractVersion = process.env.REVIEW_CALLER_CONTRACT_VERSION || '';
             const releaseProvenanceValid = callerContractVersion
               ? callerContractVersion === '1' && runtimeReleaseValid
@@ -1128,27 +1606,71 @@ jobs:
               (receipt.decision === 'PASS' && receipt.findings.length === 0) ||
               (receipt.decision === 'BLOCK' && receipt.findings.length > 0)
             );
+            // snd-quality-gate#358 option D: digest entries the prepare job
+            // recomputed. Any entry that is not verified keeps the receipt
+            // from passing; a malformed record is treated the same way.
+            let digestChecks = null;
+            try {
+              const parsed = JSON.parse(process.env.DIGEST_CHECKS || '[]');
+              digestChecks = Array.isArray(parsed) && parsed.length <= 64 &&
+                parsed.every((check) => check && typeof check === 'object' &&
+                  ['verified', 'mismatch', 'unverified'].includes(check.result))
+                ? parsed : null;
+            } catch {
+              digestChecks = null;
+            }
+            const digestChecksClear = digestChecks !== null && digestChecks.every((check) => check.result === 'verified');
             const clear = verdictPolicyValid && valid && decisionAccountedFor &&
-              receipt.analysis_complete === true && coverageComplete && blockingFindings.length === 0;
+              receipt.analysis_complete === true && coverageComplete && blockingFindings.length === 0 &&
+              digestChecksClear;
             let conclusion = clear ? 'success' : 'failure';
             // An unavailable producer result is not a completed review
             // contract, but a structurally valid diagnostic envelope must not
             // be mislabeled as a contract violation. Only preserve a small,
             // base-owned allowlist after binding the envelope to this exact
             // request and merge preview. Arbitrary malformed JSON and identity
-            // mismatches remain result_contract_invalid.
+            // mismatches remain result_contract_invalid. The list covers every
+            // fail-closed input code the Review Agent publishes; a code missing
+            // here hid package_script_context_unresolved behind
+            // result_contract_invalid (snd-data-platform#1035).
             const bridgeDiagnosticCodes = new Set([
               'agent_internal_error',
+              'batch_checkpoint_conflict_invalid',
+              'batch_checkpoint_result_changed',
+              'batch_checkpoint_set_incomplete',
+              'batch_checkpoint_set_invalid',
+              'batch_plan_coverage_invalid',
+              'batch_plan_identity_invalid',
               'broker_input_changed',
               'broker_input_invalid',
+              'checkpoint_acceptance_invalid',
+              'checkpoint_accepted_content_unavailable',
+              'checkpoint_authority_configuration_invalid',
+              'checkpoint_authority_request_invalid',
+              'checkpoint_candidate_collision',
+              'checkpoint_diff_mismatch',
+              'checkpoint_proposal_request_invalid',
+              'checkpoint_source_bytes_mismatch',
               'diff_input_invalid',
               'model_output_invalid',
+              'model_output_schema_invalid',
               'model_unavailable',
+              'native_context_file_invalid',
+              'native_team_worker_count_invalid',
+              'package_script_context_unresolved',
+              'reconciliation_acceptance_invalid',
+              'reconciliation_checkpoint_invalid',
+              'reconciliation_evidence_invalid',
+              'request_cancel_binding_invalid',
+              'request_control_invalid',
               'request_directory_invalid',
               'request_json_invalid',
               'request_schema_invalid',
               'review_context_invalid',
               'review_context_too_large',
+              'review_subagent_assignment_invalid',
+              'review_subagent_authentication_unconfirmed',
+              'review_subagent_configuration_invalid',
               'snapshot_input_invalid',
               'snapshot_invalid',
               'snapshot_too_large',
@@ -1273,6 +1795,8 @@ jobs:
                 ? 'result_contract_invalid'
                 : receipt.decision === 'PASS' && receipt.findings.length > 0
                   ? 'decision_contract_violated'
+                  : !digestChecksClear
+                    ? 'digest_check_not_verified'
                   : !clear && receipt.decision === 'PASS'
                     ? 'review_coverage_incomplete'
                     : `decision_${receipt.decision.toLowerCase()}`;
@@ -1353,6 +1877,7 @@ jobs:
                 request_generation: process.env.REQUEST_GENERATION,
               },
             };
+            if (valid && digestChecks?.length > 0) output = { ...output, digest_checks: digestChecks };
             let receiptText = JSON.stringify(output);
             // GitHub Checks accepts at most 65,535 characters. Keep a buffer
             // for transport encoding and fail closed rather than losing a
@@ -1449,6 +1974,12 @@ jobs:
                       (bridge_retry_after_seconds ? `; retry after ${bridge_retry_after_seconds}s` : '') + '.'
                     : '') +
                   mergeRefObservation +
+                  (!digestChecksClear
+                    ? ` Digest checks: ${digestChecks === null ? 'the prepare record is malformed'
+                      : digestChecks.filter((check) => check.result !== 'verified').slice(0, 5)
+                        .map((check) => `${check.subject ?? check.manifest ?? 'manifest'} ${check.result}` +
+                          (check.reason ? ` (${check.reason})` : '')).join('; ')}.`
+                    : '') +
                   (inconclusiveExplanation ? ` ${inconclusiveExplanation}${diagnosticLink}` : ''),
               text: receiptText,
             };
@@ -2005,6 +2536,10 @@ jobs:
     # Require the trusted control-plane pool without a hosted fallback.
     runs-on: ubuntu-latest
     timeout-minutes: 3
+    outputs:
+      auto_rerequest: ${{ steps.request-finalizer.outputs.auto_rerequest }}
+      auto_rerequest_head_sha: ${{ steps.request-finalizer.outputs.auto_rerequest_head_sha }}
+      auto_rerequest_request_check_id: ${{ steps.request-finalizer.outputs.auto_rerequest_request_check_id }}
     steps:
       # Every input of this reusable workflow (verdict policy, automation
       # login, required label, PR number) is trusted only because the
@@ -2037,6 +2572,7 @@ jobs:
             };
             if (!isCanonicalCaller()) core.setFailed('AI_CLI_REVIEW_UNTRUSTED_CALLER');
       - name: End matching non-gating request contract
+        id: request-finalizer
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
         env:
           PR_NUMBER: ${{ needs.prepare-cli-review.outputs.pr_number || inputs.pr_number }}
@@ -2186,6 +2722,7 @@ jobs:
             let outcome = 'UNAVAILABLE';
             let nextAction = 'restore_service';
             let policyDigest = null;
+            let autoRerequest = null;
             // A preview GitHub never rebuilt needs the author, not the operator:
             // ARCP v2 pairs merge_preview_stale with update_branch. The
             // lifecycle stays a fail-closed terminal UNAVAILABLE.
@@ -2305,6 +2842,55 @@ jobs:
               ) {
                 policyDigest = candidatePolicyDigest;
               }
+              // Owner decision on snd-quality-gate#357 (option B): a
+              // full-coverage INCONCLUSIVE may be re-requested automatically
+              // at most once per head. This callee holds no label credential,
+              // so it only records the deterministic eligibility; the caller's
+              // labeler App acts on it. A second INCONCLUSIVE on the same
+              // head, any omitted path, incomplete analysis, or a diagnostic
+              // without a complete per-batch omission count stays blocked for
+              // a human, and INCONCLUSIVE is never reclassified.
+              if (phase === 'INCONCLUSIVE') {
+                const diagnostic = headOutput?.inconclusive_diagnostics;
+                const listedBatches = Array.isArray(diagnostic?.inconclusive_batches) &&
+                  diagnostic.inconclusive_batches.length <= 32
+                  ? diagnostic.inconclusive_batches : null;
+                const omissionCounts = (listedBatches || []).map((batch) => batch?.omitted_path_count);
+                const omittedFiles = headOutput?.omitted_files;
+                const diagnosticComplete =
+                  diagnostic?.schema_version === '1.0' &&
+                  listedBatches !== null &&
+                  diagnostic.omitted_inconclusive_batch_count === 0 &&
+                  omissionCounts.every((count) => Number.isSafeInteger(count) && count >= 0);
+                const priorInconclusive = trustedRequestChecks.some((check) => {
+                  if (check.id === requestCheck.id) return false;
+                  const prior = parseCheckOutput(check);
+                  return prior?.schema === 'ai-review-lifecycle/v2' &&
+                    (prior.phase === 'INCONCLUSIVE' || prior.auto_rerequest?.eligible === true);
+                });
+                const contextOmitted =
+                  (Array.isArray(omittedFiles) && omittedFiles.length > 0) ||
+                  omissionCounts.some((count) => Number.isSafeInteger(count) && count > 0);
+                const autoReason = headOutput?.decision !== 'INCONCLUSIVE'
+                  ? 'decision_not_inconclusive'
+                  : !approvalFence
+                    ? 'binding_not_current'
+                    : priorInconclusive
+                      ? 'head_already_inconclusive'
+                      : contextOmitted
+                        ? 'context_omitted'
+                        : headOutput?.analysis_complete !== true
+                          ? 'analysis_incomplete'
+                          : !Array.isArray(omittedFiles) || !diagnosticComplete
+                            ? 'diagnostic_incomplete'
+                            : 'full_coverage_first_inconclusive';
+                autoRerequest = {
+                  schema: 'ai-review-auto-rerequest/v1',
+                  eligible: autoReason === 'full_coverage_first_inconclusive',
+                  reason_code: autoReason,
+                  max_per_head: 1,
+                };
+              }
               if (phase === 'APPROVED') {
                 const currentGeneration = parseRequestGeneration(requestCheck);
                 const legacyRequests = trustedRequestChecks
@@ -2378,19 +2964,73 @@ jobs:
                   freshMergeTree === mergeTreeSha &&
                   freshMergeParents.length === 2 &&
                   freshMergeParents[0] === protectedBaseSha && freshMergeParents[1] === headSha;
+                // One identity predicate gates both the success write and the
+                // base-advanced neutral exception (snd-quality-gate#356), so
+                // the two paths cannot drift: the same receipt Check (id,
+                // name, app, head), byte-identical raw output, and the same
+                // newest request id AND generation (external_id).
+                const sameRawOutput = ['title', 'summary', 'text'].every((field) =>
+                  (freshHeadData.output?.[field] ?? null) === (headData.output?.[field] ?? null));
+                const freshIdentity =
+                  sameRawOutput &&
+                  freshHeadData.id === headData.id &&
+                  freshHeadData.name === 'ai-review/receipt' &&
+                  freshHeadData.app?.slug === 'github-actions' &&
+                  (freshHeadData.app?.id ?? null) === (headData.app?.id ?? null) &&
+                  freshHeadData.head_sha?.toLowerCase() === headSha &&
+                  freshNewestRequest?.id === requestCheck.id &&
+                  freshNewestRequest?.external_id === requestCheck.external_id;
                 const freshReceipt =
+                  freshIdentity &&
                   freshHeadData.status === 'completed' &&
                   freshHeadData.conclusion === 'success' &&
                   freshHeadData.external_id === headData.external_id &&
                   JSON.stringify(parseCheckOutput(freshHeadData)) === JSON.stringify(headOutput) &&
-                  newestReceipt(freshHeadChecks)?.id === headData.id &&
-                  freshNewestRequest?.id === requestCheck.id;
+                  newestReceipt(freshHeadChecks)?.id === headData.id;
                 if (!freshScope || !freshReceipt) {
-                  core.setFailed('AI_REVIEW_REQUEST_RECONCILE_FENCE_CHANGED');
-                  return;
+                  // Owner decision on snd-quality-gate#352: when ONLY the
+                  // protected base advanced after an exact-head success
+                  // receipt (head, label, request id and receipt identity all
+                  // unchanged), end the scheduling contract neutral instead
+                  // of failing the job. It never becomes success, and any
+                  // other fence change still fails closed.
+                  const freshBaseSha = freshBaseRef.data.object?.sha?.toLowerCase() || '';
+                  const freshPrBaseSha = freshPr.base.sha?.toLowerCase();
+                  // The merge preview may be rebuilt on the new base tip, or
+                  // still be the reviewed preview (old base, same tree). Any
+                  // other parent pair or tree is a non-base change.
+                  const freshPreviewMatches =
+                    freshMergeParents.length === 2 &&
+                    freshMergeParents[1] === headSha &&
+                    (freshMergeParents[0] === freshBaseSha ||
+                      (freshMergeParents[0] === protectedBaseSha && freshMergeTree === mergeTreeSha));
+                  // freshReceipt already includes freshIdentity.
+                  const baseOnlyAdvanced =
+                    freshReceipt &&
+                    freshPreviewMatches &&
+                    /^[0-9a-f]{40}$/.test(freshBaseSha) &&
+                    freshBaseSha !== protectedBaseSha &&
+                    (freshPrBaseSha === protectedBaseSha || freshPrBaseSha === freshBaseSha) &&
+                    freshPr.state === 'open' &&
+                    freshPr.draft === false &&
+                    freshPr.base.ref === baseBranch &&
+                    freshPr.head.sha?.toLowerCase() === headSha &&
+                    freshPr.head.repo?.full_name === `${context.repo.owner}/${context.repo.repo}` &&
+                    (freshPr.labels || []).some((label) => label.name === requiredLabel);
+                  if (!baseOnlyAdvanced) {
+                    core.setFailed('AI_REVIEW_REQUEST_RECONCILE_FENCE_CHANGED');
+                    return;
+                  }
+                  // ARCP v2: the reviewed binding was superseded by a base
+                  // move, not a service failure, so no outcome and no alert.
+                  phase = 'SUPERSEDED';
+                  reasonCode = 'base_advanced_after_receipt';
+                  outcome = null;
+                  nextAction = 'none';
                 }
               }
             }
+            const baseAdvancedAfterReceipt = reasonCode === 'base_advanced_after_receipt';
             const now = new Date().toISOString();
             // This remains a non-gating scheduling record: ai-review/receipt
             // is still the only review verdict.  GitHub nevertheless folds
@@ -2429,11 +3069,16 @@ jobs:
                   : phase === 'BLOCKED'
                     ? 'Inspect and resolve the blocking review findings before requesting a new review.'
                     : phase === 'INCONCLUSIVE'
-                      ? 'Investigate the inconclusive review evidence and request a fresh review.'
+                      ? autoRerequest?.eligible
+                        ? 'This full-coverage result is eligible for one automatic re-request of this head. If no new request starts, investigate the inconclusive review evidence and request a fresh review.'
+                        : 'Investigate the inconclusive review evidence and request a fresh review.'
                       : stalePreview
                         ? `GitHub did not rebuild this pull request's merge preview after ${baseBranch} advanced, so the review never started. Relabeling repeats this failure: update the branch from ${baseBranch}, then apply ${requiredLabel} again.`
-                        : 'Restore the trusted review gate, then request a fresh exact-head review.',
+                        : baseAdvancedAfterReceipt
+                          ? `The exact-head review succeeded, but ${baseBranch} advanced before this scheduling contract closed. ai-review/receipt stays bound to the reviewed base; if a merge gate needs the current base, update the branch from ${baseBranch} and apply ${requiredLabel} again.`
+                          : 'Restore the trusted review gate, then request a fresh exact-head review.',
               },
+              ...(autoRerequest ? { auto_rerequest: autoRerequest } : {}),
             };
             if (requestCheck.status === 'completed' && phase !== 'APPROVED') {
               core.notice('AI_REVIEW_REQUEST_FINALIZE_ALREADY_TERMINAL');
@@ -2454,8 +3099,30 @@ jobs:
                       ? 'AI review completed without a conclusive decision'
                       : stalePreview
                         ? `AI review not started: update the branch from ${baseBranch}`
-                        : 'AI review lifecycle unavailable',
+                        : baseAdvancedAfterReceipt
+                          ? `AI review completed; ${baseBranch} advanced after the receipt`
+                          : 'AI review lifecycle unavailable',
                 summary: 'The scheduling contract is terminal. ai-review/receipt remains the sole review verdict.',
                 text: `\`\`\`json\n${JSON.stringify(request)}\n\`\`\``,
               },
             });
+            // Publish the re-request signal only after the durable record
+            // that consumes this head's single automatic attempt reads back.
+            if (autoRerequest?.eligible) {
+              const recorded = (await github.rest.checks.get({
+                ...context.repo, check_run_id: requestCheck.id,
+              })).data;
+              const recordedRequest = parseCheckOutput(recorded);
+              if (
+                recorded?.status !== 'completed' ||
+                recordedRequest?.phase !== 'INCONCLUSIVE' ||
+                recordedRequest?.binding?.head_sha !== headSha ||
+                recordedRequest?.auto_rerequest?.eligible !== true
+              ) {
+                core.warning('AI_REVIEW_AUTO_REREQUEST_RECORD_UNVERIFIED');
+                return;
+              }
+              core.setOutput('auto_rerequest', 'eligible');
+              core.setOutput('auto_rerequest_head_sha', headSha);
+              core.setOutput('auto_rerequest_request_check_id', String(requestCheck.id));
+            }
