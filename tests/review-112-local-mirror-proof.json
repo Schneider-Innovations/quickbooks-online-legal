@@ -1,0 +1,18 @@
+{
+  "schema": "review-local-mirror-source-proof/v1",
+  "scope": "candidate bytes only; no caller activation or live compatibility asserted",
+  "protected_base_commit": "9c88c41a326a150782c977e481b23d79aa524d8d",
+  "workflow_path": ".github/workflows/codex-cli-review-receipt.yml",
+  "base_blob": "9f087da38c5da54c0447a8b7f95cc7a0aafca677",
+  "base_sha256": "3be4afcea60bd321bbe3391925a3497209f545eb7c9b507c08edbc1c79b10129",
+  "candidate_blob": "8663ad0961f06a7c4981c51a3265fa9257d2116e",
+  "candidate_sha256": "94f039b07b47df26004a7b37b5d44d8b88b2ac9ae4586655f0eead694fd8a9da",
+  "candidate_bytes": 183691,
+  "quality_gate_source": "fc41d62af5fe5c35975e463793c2c26bd61deb4c",
+  "release": "review-2026-09-24.112",
+  "extra_policy_digest": "4deaaf6103a04316395eb1d7e99a08508d9826e5f97775f34ed0b21685b585a2",
+  "reviewed_agent_source_commit": "c2c73cc6ff7e38eb5dc4288ab796d58e0eecbdc2",
+  "reviewed_agent_sha256": "64ea4acd9242bfd0a67e5e250903ef30980ad39f446f3b88e5ac905e0d0a0ffc",
+  "official_source_review_receipt": "https://github.com/Schneider-Innovations/platform-infrastructure/runs/115133040755",
+  "platform_admission_pr": "https://github.com/Schneider-Innovations/platform-infrastructure/pull/2672"
+}
