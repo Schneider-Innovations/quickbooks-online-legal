@@ -9,3 +9,21 @@ The future mirror is183773 bytes/SHA256 `7a72bf4782439e4885a967964c980e9e58c64bf
 `python3 tests/verify_review_113_local_blob.py` checks the exact protected-base source, full patch, resulting Git blob/size/hash, both new entries and additive retention, and normal generated admission hash. It fails on the unchanged protected-base admission workflow, then passes on this generated source. Existing `verify_review_112_local_blob.py` remains green. The proof JSON truthfully labels formal review pending and binds the real normal bundle; it contains no guessed official receipt.
 
 Normal exact-head execution/verdict/approved-pin gates remain required. Changes to head or protected base invalidate prior review. Source publication/merge and all later live operations remain root/Owner controlled.
+
+The complete future mirror source is supplied directly as
+`tests/fixtures/review-113-local-mirror.yml`, not as an executed workflow or a
+request to alter the active mirror. Its183773 bytes are byte-identical to the
+normal18-caller generator output and to the exact protected-base+two-digest
+patch reconstruction, yielding Gitblob318e/SHA2567a72 above. The verifier now
+requires this regular, non-symlink fixture and compares every byte before
+accepting the source proof. Missing or damaged source is refused; three
+maintained controls demonstrate refusal and acceptance.
+
+The three nominated comments in the admission workflow point only to this
+source fixture, proof and verifier. Removing exactly those comments restores
+the original normal generated admission SHA256 recorded in the proof;
+executable fields and accepted blob/ref/policy sets are unchanged. Full
+plaintext fixture additions are normal changed-file input, with existing
+Review111 chunk/bundle bounds retained; no producer limit, scope, review
+criteria or result is changed. Transport completeness is not formal PASS, and
+unchanged oversized historical references remain explicitly unsupplied.

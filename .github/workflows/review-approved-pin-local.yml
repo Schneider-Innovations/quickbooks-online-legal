@@ -29,6 +29,9 @@ jobs:
       # R112 complete candidate diff: tests/review-112-local-mirror.patch
       # Provenance: tests/review-112-local-mirror-proof.json
       # Verify exact base/candidate Git bytes: tests/verify_review_112_local_blob.py
+      # R113 future mirror source: tests/fixtures/review-113-local-mirror.yml
+      # R113 byte identity/provenance: tests/review-113-local-mirror-proof.json
+      # R113 fixture/reconstruction check: tests/verify_review_113_local_blob.py
       APPROVED_LOCAL_WORKFLOW_BLOBS: |
         Schneider-Innovations/amazon-store-outpost-legal=030b2c689195c2a092b3f1e8557d7b8b06adea93
         Schneider-Innovations/amazon-store-outpost-legal=0337ebe7b69dd26a95c43917fdb33732ab10a5b0

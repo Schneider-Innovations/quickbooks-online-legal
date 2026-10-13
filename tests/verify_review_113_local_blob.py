@@ -23,6 +23,14 @@ def main():
     assert len(candidate) == PROOF['candidate_bytes']
     assert helper['git_blob'](candidate) == PROOF['candidate_blob']
     assert hashlib.sha256(candidate).hexdigest() == PROOF['candidate_sha256']
+    # This fixture is source evidence, not an activated GitHub workflow.
+    assert PROOF['candidate_source_fixture'] == 'tests/fixtures/review-113-local-mirror.yml'
+    fixture = HERE / 'fixtures/review-113-local-mirror.yml'
+    assert fixture.is_file() and not fixture.is_symlink(), 'candidate full-source fixture missing'
+    supplied = fixture.read_bytes()
+    assert supplied == candidate, 'candidate full-source fixture differs from exact reconstruction'
+    assert helper['git_blob'](supplied) == PROOF['candidate_blob']
+    assert hashlib.sha256(supplied).hexdigest() == PROOF['candidate_sha256']
     # Admission must not replace the caller that protected main executes.
     assert (ROOT / PROOF['workflow_path']).read_bytes() == base
     approved = (ROOT / PROOF['admission_path']).read_bytes()
@@ -32,6 +40,20 @@ def main():
     assert entries(previous) <= entries(approved)
     assert entries(approved) - entries(previous) == expected_new
     assert hashlib.sha256(approved).hexdigest() == PROOF['admission_after_sha256']
+    # Remove only the three nominated comments, then bind the original normal
+    # generator output. No executable workflow fields or accepted sets change.
+    unannotated = approved
+    annotations = [
+        '      # R113 future mirror source: tests/fixtures/review-113-local-mirror.yml',
+        '      # R113 byte identity/provenance: tests/review-113-local-mirror-proof.json',
+        '      # R113 fixture/reconstruction check: tests/verify_review_113_local_blob.py',
+    ]
+    assert PROOF['admission_source_annotations'] == annotations
+    for line in annotations:
+        raw_line = (line + '\n').encode()
+        assert unannotated.count(raw_line) == 1
+        unannotated = unannotated.replace(raw_line, b'')
+    assert hashlib.sha256(unannotated).hexdigest() == PROOF['normal_generated_admission_sha256']
     print('verified generated R113 candidate and add-only source admission:', PROOF['candidate_blob'])
 
 if __name__ == '__main__':

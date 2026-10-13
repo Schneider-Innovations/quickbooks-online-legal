@@ -21,10 +21,17 @@
   "source_formal_status": "pending",
   "admission_path": ".github/workflows/review-approved-pin-local.yml",
   "admission_before_sha256": "dfdc7d64505e6f264d94ea797496897dca2bf5eaf27caee2fcc932f95b60563c",
-  "admission_after_sha256": "6ab839302d33009bac78f0f349565160a4ebaf2bd82e37a72eb4a5355245185a",
+  "admission_after_sha256": "be3a83b3c84f30b6826dd0fd61892bc99d3177f1d4638576ccd5b6021f124a94",
   "normal_bundle_sha256": "25685651eecd1ac2f0d9d655a22168e35d8b297d1a08d50d80c308f98529de75",
   "admitted_repositories": [
     "amazon-store-outpost-legal",
     "quickbooks-online-legal"
+  ],
+  "candidate_source_fixture": "tests/fixtures/review-113-local-mirror.yml",
+  "normal_generated_admission_sha256": "6ab839302d33009bac78f0f349565160a4ebaf2bd82e37a72eb4a5355245185a",
+  "admission_source_annotations": [
+    "      # R113 future mirror source: tests/fixtures/review-113-local-mirror.yml",
+    "      # R113 byte identity/provenance: tests/review-113-local-mirror-proof.json",
+    "      # R113 fixture/reconstruction check: tests/verify_review_113_local_blob.py"
   ]
 }
