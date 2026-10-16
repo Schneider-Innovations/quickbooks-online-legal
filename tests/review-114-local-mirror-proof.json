@@ -1,0 +1,27 @@
+{
+  "schema": "review-local-mirror-source-proof/v1",
+  "scope": "candidate bytes and add-only source admission only; no caller activation or live compatibility asserted",
+  "protected_base_commit": "edb175ab1f3522d48bb946ae372e7cee02a0e8a7",
+  "workflow_path": ".github/workflows/codex-cli-review-receipt.yml",
+  "base_blob": "8663ad0961f06a7c4981c51a3265fa9257d2116e",
+  "base_sha256": "94f039b07b47df26004a7b37b5d44d8b88b2ac9ae4586655f0eead694fd8a9da",
+  "candidate_blob": "b8cd44be41217540f4fc06ff1b2bc6a661918178",
+  "candidate_sha256": "a2b067b9bb9364ca60d712ad9bc698c85e0bf849c8be51082529eeacc5a4a142",
+  "candidate_bytes": 183773,
+  "quality_gate_source": "fc41d62af5fe5c35975e463793c2c26bd61deb4c",
+  "release": "review-2026-10-16.114",
+  "added_policy_digests": [
+    "50337ff6a61c2c7db85eb3983443efdcec221f5de4b42dadb04b7f6358eca603"
+  ],
+  "reviewed_agent_sha256": "61c17c4701989c2909ca9079bdfc029c923bef6ff8232b86f4cf217c3e030044",
+  "platform_admission_pr": "https://github.com/Schneider-Innovations/platform-infrastructure/pull/2818",
+  "platform_publication_pr": "https://github.com/Schneider-Innovations/platform-infrastructure/pull/2819",
+  "admission_path": ".github/workflows/review-approved-pin-local.yml",
+  "admission_before_sha256": "4cbd934398e91d25d3176c60db873517fa1333a1ecf9c693809870ff81fc285f",
+  "admission_after_sha256": "a537d21b043d08a541b784ff14179c1afe44a55ebad46b235bd54dded1352777",
+  "candidate_source_fixture": "tests/fixtures/review-114-local-mirror.yml",
+  "admitted_repositories": [
+    "amazon-store-outpost-legal",
+    "quickbooks-online-legal"
+  ]
+}

@@ -1,0 +1,10 @@
+--- a/.github/workflows/codex-cli-review-receipt.yml
++++ b/.github/workflows/codex-cli-review-receipt.yml
+@@ -1283,6 +1283,7 @@
+               '4b2e6283dcdb3feced57cf6f3a4746c7a2ca52d65f50a76a45e2957898e49ba0',
+               '4deaaf6103a04316395eb1d7e99a08508d9826e5f97775f34ed0b21685b585a2',
+               '4e1789156cbe89dd89e8085258ae04d2b3044c9df48f251b68a5636064d39d23',
++              '50337ff6a61c2c7db85eb3983443efdcec221f5de4b42dadb04b7f6358eca603',
+               '5373e765e5d0ab2a1b836df655f510a63667bf689f4a1afd33a18285760d50b8',
+               '544f65158dab87376a913736b09865e50d333f8d31ba0132483ad470e16317b0',
+               '61849815e1961f6e3c09e4894711452016bdc23ed13dbae843e0a2413272d81b',
