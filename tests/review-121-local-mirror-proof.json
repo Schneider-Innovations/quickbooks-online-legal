@@ -1,0 +1,25 @@
+{
+  "schema": "review-local-mirror-source-proof/v1",
+  "scope": "candidate bytes and add-only source admission only; no caller activation or live compatibility asserted",
+  "release": "review-2026-10-22.121",
+  "protected_base_commit": "f39a0e6b1b35f4bb0ab9d9ca1931274de80f2965",
+  "workflow_path": ".github/workflows/codex-cli-review-receipt.yml",
+  "base_blob": "a47835a3c44e3eba589a2d324ae183c88eba98d7",
+  "base_sha256": "8d1aa699bc61a946e6e19d7c153ddac255e9abc5bf0fbacb474dbf482f74b6ef",
+  "candidate_blob": "3d90ed56c8281510babb3ee46a45e1038d8dc687",
+  "candidate_sha256": "e17dcca4192905decd5ee3b754108d0f6d285178155d0ff29621752ccb625733",
+  "candidate_bytes": 218040,
+  "candidate_source_fixture": "tests/fixtures/review-121-local-mirror.yml",
+  "quality_gate_source": "3bb8c7bd859df9b7d4d1f896fa80da7cf64d00bc",
+  "added_policy_digests": [
+    "6895f69c7d789c6cb43edb335eb71778106fa4d94b1332531e25f94b7ed76b59"
+  ],
+  "agent_sha256": "d6596b0a517fff3bd9775419be046e0b2b2a09ca7a1f4880a7e9ec02889962d0",
+  "admission_path": ".github/workflows/review-approved-pin-local.yml",
+  "admission_before_sha256": "0a87bf31b5858a324ab161eb69442db265dea271f9a8d15fbaf9e9a7f8751f49",
+  "admission_after_sha256": "18eb630eb675d8c47acd218021600f8d4f998537a531253fa45f6299faf41f4b",
+  "admitted_repositories": [
+    "amazon-store-outpost-legal",
+    "quickbooks-online-legal"
+  ]
+}
