@@ -11,7 +11,8 @@
       "kind": "historical",
       "patch_sha256": "4f6d2147d87ddd0c107dbc2b40a51533835d2562c0c13c63d641fa857dd8d500",
       "sha256": "43499b13b9af433890a85b37ac7a7802d006ea2a1917f8070b9332100e20863b",
-      "source_release": "review-2026-10-24.124"
+      "source_release": "review-2026-10-24.124",
+      "complete_source_fixture": "tests/fixtures/review-125-historical-complete-workflow.yml"
     },
     {
       "blob": "6247f20b7c56979d023a2e93a5649c28a883bd67",
@@ -19,7 +20,8 @@
       "kind": "policy",
       "patch_sha256": "1099e5e43f5f0005ba3ad226d461d0b01820ef5663bc1a455e0d41190f5240e1",
       "sha256": "12776dd6788cb839f1f2ba1d3ef107fca13547bd63a2a877c91de2b75b3ad770",
-      "source_release": "review-2026-10-24.125"
+      "source_release": "review-2026-10-24.125",
+      "complete_source_fixture": "tests/fixtures/review-125-policy-complete-workflow.yml"
     }
   ],
   "policy_digest": "f635db7575c352732fd0303666030cefe246dc4cc97841a19a23fb3c18c63ee5",

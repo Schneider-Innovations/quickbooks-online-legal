@@ -43,6 +43,9 @@ def main():
         assert len(result) == row['bytes']
         assert helper['git_blob'](result) == row['blob']
         assert hashlib.sha256(result).hexdigest() == row['sha256']
+        fixture = ROOT / ('tests/fixtures/review-125-' + row['kind'] + '-complete-workflow.yml')
+        assert row['complete_source_fixture'] == fixture.relative_to(ROOT).as_posix()
+        assert fixture.read_bytes() == result, 'complete mirror source differs from reconstruction'
     before, after = git(ADMISSION), (ROOT / ADMISSION).read_bytes()
     assert hashlib.sha256(before).hexdigest() == PROOF['admission_before_sha256']
     assert hashlib.sha256(after).hexdigest() == PROOF['admission_after_sha256']
