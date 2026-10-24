@@ -1,0 +1,34 @@
+--- a/.github/workflows/codex-cli-review-receipt.yml
++++ b/.github/workflows/codex-cli-review-receipt.yml
+@@ -55,6 +55,10 @@
+     # never reference this secret in a job, environment, or bridge command.
+     secrets:
+       codex_trigger_token:
++        required: false
++      # Explicit forwarding is required even when the prepare job resolves
++      # the value from the caller repository's protected environment.
++      DEPENDENCY_PIN_READ_TOKEN:
+         required: false
+     # snd-quality-gate#357: set only for the first full-coverage INCONCLUSIVE
+     # on a head, after its durable record reads back. This workflow holds no
+@@ -2760,11 +2764,18 @@
+               const externalId = `${name}:${process.env.PR_NUMBER}:${expectedHead}:${expectedMerge}:${context.runId}:head`;
+               await withPublicationRetry(async (attempt) => {
+                 // An ambiguous create may have succeeded: adopt it instead of
+-                // publishing a second gate Check for this run.
++                // publishing a second gate Check for this run. The external id
++                // does not include the run attempt, so adopt only a Check whose
++                // conclusion and output are exactly this attempt's; a re-run
++                // never keeps an earlier attempt's gate (pi#3092 review).
+                 if (attempt > 0) {
+                   const existing = (await github.rest.checks.listForRef({
+                     ...context.repo, ref: expectedHead, check_name: name, filter: 'all', per_page: 100,
+-                  })).data.check_runs.find((check) => check.external_id === externalId);
++                  })).data.check_runs.find((check) => check.external_id === externalId &&
++                    check.conclusion === gateConclusion &&
++                    check.output?.title === gateOutput.title &&
++                    check.output?.summary === gateOutput.summary &&
++                    check.output?.text === gateOutput.text);
+                   if (existing) return { data: existing };
+                 }
+                 return github.rest.checks.create({
