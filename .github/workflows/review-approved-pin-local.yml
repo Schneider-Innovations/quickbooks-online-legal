@@ -35,6 +35,7 @@ jobs:
       APPROVED_LOCAL_WORKFLOW_BLOBS: |
         Schneider-Innovations/amazon-store-outpost-legal=0c99773b62a59a8fddd1dc26f45b448d5fb7f0c4
         Schneider-Innovations/amazon-store-outpost-legal=3d90ed56c8281510babb3ee46a45e1038d8dc687
+        Schneider-Innovations/amazon-store-outpost-legal=6247f20b7c56979d023a2e93a5649c28a883bd67
         Schneider-Innovations/amazon-store-outpost-legal=6ec24bb9e4fe669b42a899c42e29351e8d2fb11a
         Schneider-Innovations/amazon-store-outpost-legal=7b1878c14da0d4db7833ce4067e9b29c7bb23712
         Schneider-Innovations/amazon-store-outpost-legal=7cff708e027f8309e5823b2668c587a832c126f9
@@ -43,9 +44,11 @@ jobs:
         Schneider-Innovations/amazon-store-outpost-legal=a47835a3c44e3eba589a2d324ae183c88eba98d7
         Schneider-Innovations/amazon-store-outpost-legal=b8cd44be41217540f4fc06ff1b2bc6a661918178
         Schneider-Innovations/amazon-store-outpost-legal=e644dad52ea06cacdf590dcb2a9f6a7264c684e5
+        Schneider-Innovations/amazon-store-outpost-legal=fb2d02598911677ee916134e586f2669e0e5a566
         Schneider-Innovations/amazon-store-outpost-legal=fb9b1392923f25a9f654b18d870a0919e9dba875
         Schneider-Innovations/quickbooks-online-legal=0c99773b62a59a8fddd1dc26f45b448d5fb7f0c4
         Schneider-Innovations/quickbooks-online-legal=3d90ed56c8281510babb3ee46a45e1038d8dc687
+        Schneider-Innovations/quickbooks-online-legal=6247f20b7c56979d023a2e93a5649c28a883bd67
         Schneider-Innovations/quickbooks-online-legal=6ec24bb9e4fe669b42a899c42e29351e8d2fb11a
         Schneider-Innovations/quickbooks-online-legal=7b1878c14da0d4db7833ce4067e9b29c7bb23712
         Schneider-Innovations/quickbooks-online-legal=7cff708e027f8309e5823b2668c587a832c126f9
@@ -54,6 +57,7 @@ jobs:
         Schneider-Innovations/quickbooks-online-legal=a47835a3c44e3eba589a2d324ae183c88eba98d7
         Schneider-Innovations/quickbooks-online-legal=b8cd44be41217540f4fc06ff1b2bc6a661918178
         Schneider-Innovations/quickbooks-online-legal=e644dad52ea06cacdf590dcb2a9f6a7264c684e5
+        Schneider-Innovations/quickbooks-online-legal=fb2d02598911677ee916134e586f2669e0e5a566
         Schneider-Innovations/quickbooks-online-legal=fb9b1392923f25a9f654b18d870a0919e9dba875
       APPROVED_REUSABLE_REFS: |
         0184a8e1d905b285b5357a50d08d1877edcb62de
