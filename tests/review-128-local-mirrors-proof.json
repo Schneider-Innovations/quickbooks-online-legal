@@ -1,0 +1,48 @@
+{
+  "schema": "review-source-bound-local-admission/v2",
+  "scope": "source evidence only; no caller activation or runtime compatibility claimed",
+  "protected_base_commit": "b51d6bbe218ffa4b1fdb1a73b9902af6a8e3448c",
+  "composition_source_ref": "e3b5d77d5164a0024a64b7e60f150d06e76cda0a",
+  "base_blob": "6247f20b7c56979d023a2e93a5649c28a883bd67",
+  "base_sha256": "12776dd6788cb839f1f2ba1d3ef107fca13547bd63a2a877c91de2b75b3ad770",
+  "admission_before_sha256": "7399a5d616c2e07fe84935d670a37cb48fe92bc141b861f60ba085f3fa16193d",
+  "admission_after_sha256": "3bd601ed24ffcc1c5bbcd26620859005461a38b62569a81bd66f3371ab87eaae",
+  "mirrors": [
+    {
+      "source_release": "review-2026-10-24.126",
+      "release_sha256": "caef8ae5335f94a6d74dad3084310fcdcbd4f427706c5dc7fb518cf0cdd6ab7d",
+      "contracts_sha256": "bb78fdc8faaf3d964126a495c824623a27c4d71cd7f16d3984e303d4d2fc24d1",
+      "quality_gate_source": "0d22980fabed811ff5ed7be85d1bc12e8bbdd3b3",
+      "blob": "f6e3007283ef4be2bbae85a7481a92fed012a0a0",
+      "sha256": "c3126e89b072a7977d87c6b4b3698bdec3382291e091fd3f208233df5116ab7d",
+      "bytes": 219022,
+      "patch": "tests/review-128-from-running-126-mirror.patch",
+      "patch_sha256": "f59950b6da452ac298f0f1e5b7880ba433b25e314e734d5821c6354878d6c652",
+      "complete_source_fixture": "tests/fixtures/review-128-126-complete-workflow.yml"
+    },
+    {
+      "source_release": "review-2026-10-27.127",
+      "release_sha256": "f7ddac35ab2473b485d6b153786d5d7891a355eecbd03384834bd580d98f99b6",
+      "contracts_sha256": "0086ad3f4301acdfe0dfa6ac0f42fa475e86a3682bea9808ea7bb0f6d1bee819",
+      "quality_gate_source": "8a6bb0fe5daa478204346cf3f8f5be1fd3298007",
+      "blob": "f41984cb707ff0a52a3a23f3d1cd5c21245ddd83",
+      "sha256": "b8862e71ccd92fd3b545bddc5c42c3fe24df5afd653aca507912aceb53e60040",
+      "bytes": 220927,
+      "patch": "tests/review-128-from-running-127-mirror.patch",
+      "patch_sha256": "64f06180e61f368359206c0f2ca9540d780cea75f8b5c973d976ecb7a7b92fee",
+      "complete_source_fixture": "tests/fixtures/review-128-127-complete-workflow.yml"
+    },
+    {
+      "source_release": "review-2026-11-02.128",
+      "release_sha256": "7574d4b8a858e7a78ce0747f2c91aa0703d17329b093407508ff2cc08aa0e7ce",
+      "contracts_sha256": "edeca196f98611de354bce47b1ba0e70c9b7642e8507ed4138f10654ecf97927",
+      "quality_gate_source": "8a6bb0fe5daa478204346cf3f8f5be1fd3298007",
+      "blob": "9a67fa62fcfebb30ab52e23176917976c7697955",
+      "sha256": "9a9166cbbd70a112cf839d5573a8a9081adb8db0b4d333d2e2dbdb7453902e25",
+      "bytes": 221009,
+      "patch": "tests/review-128-from-running-128-mirror.patch",
+      "patch_sha256": "3c32da4a712c4640e82b13cdecf97d2ac05b96b4950d3acf4967184e4b2084c0",
+      "complete_source_fixture": "tests/fixtures/review-128-128-complete-workflow.yml"
+    }
+  ]
+}
