@@ -34,6 +34,7 @@ jobs:
       # R113 fixture/reconstruction check: tests/verify_review_113_local_blob.py
       APPROVED_LOCAL_WORKFLOW_BLOBS: |
         Schneider-Innovations/amazon-store-outpost-legal=0c99773b62a59a8fddd1dc26f45b448d5fb7f0c4
+        Schneider-Innovations/amazon-store-outpost-legal=38c10a254314ed1a290d6c2a069f3d1bbb21abcd
         Schneider-Innovations/amazon-store-outpost-legal=3d90ed56c8281510babb3ee46a45e1038d8dc687
         Schneider-Innovations/amazon-store-outpost-legal=6247f20b7c56979d023a2e93a5649c28a883bd67
         Schneider-Innovations/amazon-store-outpost-legal=6ec24bb9e4fe669b42a899c42e29351e8d2fb11a
@@ -50,6 +51,7 @@ jobs:
         Schneider-Innovations/amazon-store-outpost-legal=fb2d02598911677ee916134e586f2669e0e5a566
         Schneider-Innovations/amazon-store-outpost-legal=fb9b1392923f25a9f654b18d870a0919e9dba875
         Schneider-Innovations/quickbooks-online-legal=0c99773b62a59a8fddd1dc26f45b448d5fb7f0c4
+        Schneider-Innovations/quickbooks-online-legal=38c10a254314ed1a290d6c2a069f3d1bbb21abcd
         Schneider-Innovations/quickbooks-online-legal=3d90ed56c8281510babb3ee46a45e1038d8dc687
         Schneider-Innovations/quickbooks-online-legal=6247f20b7c56979d023a2e93a5649c28a883bd67
         Schneider-Innovations/quickbooks-online-legal=6ec24bb9e4fe669b42a899c42e29351e8d2fb11a
