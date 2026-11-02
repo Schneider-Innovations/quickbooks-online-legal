@@ -1,0 +1,96 @@
+--- a/.github/workflows/codex-cli-review-receipt.yml
++++ b/.github/workflows/codex-cli-review-receipt.yml
+@@ -55,6 +55,14 @@
+     # never reference this secret in a job, environment, or bridge command.
+     secrets:
+       codex_trigger_token:
++        required: false
++      # Explicit forwarding is required even when the prepare job resolves
++      # the value from the caller repository's protected environment.
++      DEPENDENCY_PIN_READ_TOKEN:
++        required: false
++      # Every caller layer must explicitly forward this name, even when its
++      # value is resolved from AWF's protected Environment at this job.
++      DEPENDENCY_PIN_READER_APP_PRIVATE_KEY:
+         required: false
+     # snd-quality-gate#357: set only for the first full-coverage INCONCLUSIVE
+     # on a head, after its durable record reads back. This workflow holds no
+@@ -436,14 +444,46 @@
+           persist-credentials: false
+           submodules: false
+ 
++      - name: Mint the dedicated Skills dependency reader token
++        if: github.repository == 'Schneider-Innovations/snd-agent-workflows' && vars.DEPENDENCY_PIN_READER_APP_ID != ''
++        id: dependency-reader-token
++        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
++        with:
++          app-id: ${{ vars.DEPENDENCY_PIN_READER_APP_ID }}
++          private-key: ${{ secrets.DEPENDENCY_PIN_READER_APP_PRIVATE_KEY }}
++          owner: Schneider-Innovations
++          repositories: snd-agent-skills
++          permission-checks: read
++          permission-contents: read
++          permission-metadata: read
++          permission-pull-requests: read
++
++      - name: Verify the dedicated reader installation identity
++        if: github.repository == 'Schneider-Innovations/snd-agent-workflows' && vars.DEPENDENCY_PIN_READER_APP_ID != ''
++        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
++        env:
++          APP_ID: ${{ vars.DEPENDENCY_PIN_READER_APP_ID }}
++          APP_SLUG: ${{ steps.dependency-reader-token.outputs.app-slug }}
++          INSTALLATION_ID: ${{ steps.dependency-reader-token.outputs.installation-id }}
++        with:
++          script: |
++            if (process.env.APP_ID !== '5504630' ||
++                process.env.APP_SLUG !== 'snd-skills-dependency-reader' ||
++                process.env.INSTALLATION_ID !== '176030942') {
++              core.setFailed('AI_REVIEW_DEPENDENCY_READER_IDENTITY_MISMATCH');
++            }
++
+       - id: pins
+         name: Verify the Skills dependency pin with a read-only token
+         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+         timeout-minutes: 3
+         env:
+-          # The only reference to this secret. It is read-only on
+-          # snd-agent-skills and never reaches a log, an output or a file.
+-          DEPENDENCY_PIN_READ_TOKEN: ${{ secrets.DEPENDENCY_PIN_READ_TOKEN }}
++          # Native Node fetch must use the runner's existing restricted proxy.
++          NODE_USE_ENV_PROXY: '1'
++          # A configured App must mint and pass identity verification above.
++          # The legacy PAT remains unchanged for callers without App config.
++          # The token never reaches the isolated review worker or an artifact.
++          DEPENDENCY_PIN_READ_TOKEN: ${{ vars.DEPENDENCY_PIN_READER_APP_ID != '' && steps.dependency-reader-token.outputs.token || secrets.DEPENDENCY_PIN_READ_TOKEN }}
+           BASE_SHA: ${{ steps.context.outputs.base_sha }}
+           MERGE_SHA: ${{ steps.context.outputs.merge_sha }}
+           REPOSITORY: ${{ github.repository }}
+@@ -1711,6 +1751,7 @@
+               '159ba30289199ee42cdb9bb8da5fbcf60b10a1b09bdda3f21d486ab95e4c8774',
+               '15a5fe74b4c2e26bc586729c549bdb6214b2a4caa62ab2e0f578f35f2a34f481',
+               '220dc2dd475fead61d5b680f6e0ae877bd122da3c74bbada72b6948624db8dcd',
++              '22343f3f10e1a303d0bc4430a72576596c8e6fcc5edd296976d67c307ad8fc45',
+               '23d49a1ff815b53cd1a192a4a25bd62a31fc61f197ba83b9da76109eb52cddb8',
+               '24d2b2b2f24645b7cea3664ef1766fcddc4c3165336b1acc9c1753098a6bfa0e',
+               '355c6e41a3ffe43ff5bcb9ffce0e3c7ec081c0d5018fb298eb9a98c1440ab2db',
+@@ -2761,11 +2802,18 @@
+               const externalId = `${name}:${process.env.PR_NUMBER}:${expectedHead}:${expectedMerge}:${context.runId}:head`;
+               await withPublicationRetry(async (attempt) => {
+                 // An ambiguous create may have succeeded: adopt it instead of
+-                // publishing a second gate Check for this run.
++                // publishing a second gate Check for this run. The external id
++                // does not include the run attempt, so adopt only a Check whose
++                // conclusion and output are exactly this attempt's; a re-run
++                // never keeps an earlier attempt's gate (pi#3092 review).
+                 if (attempt > 0) {
+                   const existing = (await github.rest.checks.listForRef({
+                     ...context.repo, ref: expectedHead, check_name: name, filter: 'all', per_page: 100,
+-                  })).data.check_runs.find((check) => check.external_id === externalId);
++                  })).data.check_runs.find((check) => check.external_id === externalId &&
++                    check.conclusion === gateConclusion &&
++                    check.output?.title === gateOutput.title &&
++                    check.output?.summary === gateOutput.summary &&
++                    check.output?.text === gateOutput.text);
+                   if (existing) return { data: existing };
+                 }
+                 return github.rest.checks.create({
