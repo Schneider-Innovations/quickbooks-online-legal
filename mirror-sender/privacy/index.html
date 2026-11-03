@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow, noarchive, nosnippet, noimageindex, notranslate">
+  <meta name="googlebot" content="noindex, nofollow, noarchive, nosnippet, noimageindex, notranslate">
+  <meta name="bingbot" content="noindex, nofollow, noarchive, nosnippet, noimageindex, notranslate">
+  <meta name="google" content="notranslate">
+  <meta name="ai" content="noai, noimageai">
+  <title>Privacy Policy — SND Mirror Sender</title>
+  <style>
+:root { color-scheme: light; --bg: #f5f1e8; --panel: #fffaf2; --text: #1f1f1f; --muted: #5c5448; --accent: #8c4b1f; --border: #d9ccb8; --shadow: 0 18px 40px rgba(67,46,24,0.08); }
+* { box-sizing: border-box; }
+body { margin: 0; font-family: Georgia, "Times New Roman", serif; background: radial-gradient(circle at top left, rgba(207,171,120,0.2), transparent 28%), linear-gradient(180deg, #f0e5d4 0%, var(--bg) 45%, #efe6d7 100%); color: var(--text); line-height: 1.65; }
+main { max-width: 860px; margin: 0 auto; padding: 48px 20px 72px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 24px; box-shadow: var(--shadow); overflow: hidden; }
+.hero { padding: 40px 32px 28px; border-bottom: 1px solid var(--border); background: linear-gradient(135deg, rgba(140,75,31,0.08), rgba(140,75,31,0.02)), linear-gradient(180deg, rgba(255,255,255,0.75), rgba(255,250,242,0.95)); }
+.eyebrow { margin: 0 0 10px; font-size: 0.8rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); }
+h1 { margin: 0; font-size: clamp(2rem, 4vw, 3.4rem); line-height: 1.05; font-weight: 700; }
+.intro { margin: 18px 0 0; max-width: 60ch; color: var(--muted); font-size: 1.05rem; }
+.meta { margin-top: 18px; color: var(--muted); font-size: 0.95rem; }
+.content { padding: 12px 32px 36px; }
+section { padding-top: 18px; }
+h2 { margin: 0 0 10px; font-size: 1.2rem; color: var(--accent); }
+p { margin: 0 0 14px; }
+ul { margin: 0 0 14px 20px; padding: 0; }
+li + li { margin-top: 6px; }
+.contact { margin-top: 10px; padding: 18px 20px; background: rgba(140,75,31,0.06); border: 1px solid rgba(140,75,31,0.15); border-radius: 16px; }
+a { color: var(--accent); }
+@media (max-width: 640px) { .hero, .content { padding-left: 20px; padding-right: 20px; } main { padding-top: 24px; padding-bottom: 40px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <article class="card">
+      <div class="hero">
+        <p class="eyebrow">Privacy Notice</p>
+        <h1>SND Mirror Sender</h1>
+        <p class="intro">How the internal Odoo to QuickBooks Online mirror processes approved accounting records. Internal tool — not a public-facing product.</p>
+        <p class="meta">Operated by Schneider Innovations Group, LLC · Effective date: November 2, 2026</p>
+      </div>
+      <div class="content">
+        <p><a href="../">Mirror Sender legal</a> · <a href="../eula/">End-User License Agreement</a></p>
+<section><h2>1. Scope</h2><p>This notice covers SND Mirror Sender, also referred to internally as SND QBO Mirror Sender (the Integration). It is an internal Odoo to QuickBooks Online accounting mirror for specifically authorized Schneider Innovations group companies. It is not offered to the public or to unrelated third parties.</p><p>The operator is Schneider Innovations Group, LLC. Production mirroring is subject to separate company approval and validated setup.</p></section><section><h2>2. Information we access and write</h2><p>Only for approved and administrator-authorized company files, the Integration processes the records needed for its enabled functions:</p><ul><li>Approved Odoo purchase orders, vendor bills, vendor credits and supplier payment accounting records, and their QuickBooks counterparts</li><li>Approved product Item creation data and related account or vendor references</li><li>Company identifiers, record references, dates, currencies, line descriptions, amounts and document relationships</li><li>Readback results, reconciliation balances and status, request identifiers, hashes, timestamps and error information</li></ul><p>Business records and free-text descriptions can contain supplier names, contact details or other personal information. The Integration also needs OAuth tokens and technical service credentials for its authorized connections. It does not ask users to provide their Intuit login passwords.</p></section><section><h2>3. How we use the data</h2><p>We use the data to mirror approved Odoo accounting records into QuickBooks Online, check for existing copies, read back results, report outcomes to the Odoo mirror ledger, reconcile the two systems, investigate exceptions, and support or secure the integration. Access is restricted to the company connections and functions that have been approved.</p></section><section><h2>4. What we do not do</h2><ul><li>We do not sell or rent QuickBooks data or disclose it for unrelated purposes.</li><li>We do not use QuickBooks data for advertising, profiling individuals, or training general-purpose AI models.</li><li>We do not use this Integration to initiate bank transfers, charge cards, process ACH transactions, or provide lending, insurance, or investment services.</li></ul><p>A QuickBooks BillPayment record is an accounting record of a supplier payment. Creating that record through this Integration does not itself transfer money.</p></section><section><h2>5. Storage and security</h2><ul><li>Integration records are handled in access-controlled company systems. Authorized finance, engineering and support personnel receive access only as needed for their duties.</li><li>The intended production credential store is the dedicated QBO Mirror (prod) 1Password vault, using the mirror-specific service account and separate credentials from the read-only QBO integration. Credentials must not be committed to source control or placed in public pages.</li><li>External application traffic uses HTTPS. Company authorization, sender stop controls, payload checks and readback verification form part of the intended production controls.</li></ul><p>Data is shared with Intuit, the authorized Odoo service, and approved infrastructure or service providers only as needed to deliver and secure the Integration, subject to applicable confidentiality and data-protection requirements. It is not processed on Intuit’s behalf.</p><p>Production processing and storage locations are identified in section 7. Provider access is limited to the services needed to operate and secure the authorized integration.</p></section><section><h2>6. Data retention</h2><p>Transient sender working copies of complete integration payloads are retained for no more than 30 days from creation. Ordinary operational logs are retained for no more than 90 days from generation. These limits apply to sender working copies and ordinary logs, not to the company’s independent accounting books or its accounting mirror ledger.</p><p>Company accounting records and the accounting mirror ledger follow the applicable company-approved accounting retention schedule and legal recordkeeping requirements. Backup copies and records subject to a necessary legal hold follow the relevant approved backup or hold procedure. These accounting and backup schedules are separate from the working-copy and ordinary-log limits above.</p><p>When a company disconnects or revokes consent, new access and processing for that connection must stop, and its stored authorization credentials must be removed or invalidated. We handle authorized deletion requests subject to applicable recordkeeping obligations. Disconnection does not reverse or erase accounting entries already held independently in Odoo or QuickBooks.</p></section><section>
+          <h2>7. International data transfers</h2>
+          <p>The company-side Odoo primary and standby environment is configured on infrastructure in Hong Kong. The planned production credential vault uses the United States region of 1Password.</p>
+          <p>Cloudflare services support network access and the configured Odoo backup environment. The current R2 backup configuration does not impose a country-specific storage jurisdiction, so we do not represent these backups as confined to Hong Kong or the United States. Approved service providers may process information in other countries as needed to provide their services, subject to applicable confidentiality, security and data-protection requirements.</p>
+          <p>Production mirroring is not enabled. The sender’s own execution and logging locations will be confirmed before activation, and this notice will be kept consistent with actual processing. Authorized personnel may access information from the jurisdictions in which they work. Intuit’s own processing is governed by its applicable terms and privacy notice.</p>
+        </section><section><h2>8. Intuit and QuickBooks compliance</h2><p>The requested OAuth permission is com.intuit.quickbooks.accounting. This permission includes accounting write access; it is not read-only. The Integration limits its use to its authorized companies and approved accounting functions. It does not use the QuickBooks Payments API.</p><p>An authorized administrator may disconnect the application through QuickBooks Online. Intuit services are provided by Intuit under its own terms and privacy notice. We operate this Integration independently and do not process information on Intuit’s behalf.</p></section><section><h2>9. Data and privacy requests</h2><p>For access, correction, deletion, security or disconnection requests, contact daniel.shi@schneiderinnovations.com. We verify the requester’s authority before disclosing company data or changing a connection. Applicable rights, exceptions and response requirements depend on the relevant law.</p></section><section><h2>10. Changes</h2><p>We may update this notice when the Integration’s purposes or practices change. This notice takes effect on November 2, 2026. Material changes will be communicated or consent obtained where required.</p></section><div class="contact"><p><strong>Schneider Innovations Group, LLC</strong><br>Los Angeles, California, United States<br><a href="mailto:daniel.shi@schneiderinnovations.com">daniel.shi@schneiderinnovations.com</a></p></div>
+      </div>
+    </article>
+  </main>
+</body>
+</html>
