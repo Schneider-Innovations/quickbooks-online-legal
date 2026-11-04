@@ -46,7 +46,7 @@ jobs:
     steps:
       - env:
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.client_payload.pr_number || github.event.inputs.pr_number }}
-          REVIEW_WORKFLOW_REF: 9f219a97e881ae990f074ce7f6aceef573972d10 # pragma: allowlist secret
+          REVIEW_WORKFLOW_REF: cb2a376085c2bd52f5b04b42df39af29a74d3a99 # pragma: allowlist secret
         id: admission
         name: Deduplicate active exact-head review requests
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
