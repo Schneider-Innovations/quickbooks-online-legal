@@ -1,0 +1,328 @@
+--- a/.github/workflows/codex-cli-review-receipt.yml
++++ b/.github/workflows/codex-cli-review-receipt.yml
+@@ -59,6 +59,10 @@
+       # Explicit forwarding is required even when the prepare job resolves
+       # the value from the caller repository's protected environment.
+       DEPENDENCY_PIN_READ_TOKEN:
++        required: false
++      # Every caller layer must explicitly forward this name, even when its
++      # value is resolved from AWF's protected Environment at this job.
++      DEPENDENCY_PIN_READER_APP_PRIVATE_KEY:
+         required: false
+     # snd-quality-gate#357: set only for the first full-coverage INCONCLUSIVE
+     # on a head, after its durable record reads back. This workflow holds no
+@@ -286,6 +290,14 @@
+             // to the correct exact base/head pair shortly afterwards. Keep the
+             // validation fail-closed, but allow a bounded 90-second window for
+             // that control-plane convergence.
++            // When the window ends on an exact-head preview whose base parent
++            // is an older tip of the protected branch (platform-infrastructure
++            // #3479), review that immutable preview instead of failing: its
++            // base is proven to be an ancestor of the live tip, and the receipt
++            // is bound to the base it reviewed. The drift between that base and
++            // the tip is bounded by the merge gates that already police a
++            // receipt whose base the branch has moved past (the consumer's
++            // stale-receipt invalidator, merge-drift-guard or a strict rule).
+             const mergeRefBackoffMilliseconds = [2_000, 4_000, 8_000, 16_000, 30_000, 30_000];
+             const mergeRefMaxAttempts = mergeRefBackoffMilliseconds.length + 1;
+             const safeMergeRefFailure = (error) => {
+@@ -294,6 +306,25 @@
+                 ? error.code
+                 : 'unknown';
+               return `status=${status}:code=${code}`;
++            };
++            // Commits the live tip is ahead of an older base, or 0 unless the
++            // comparison proves the older base is its strict ancestor. An
++            // unreadable comparison keeps the stale-preview failure; only an
++            // exhausted API quota is reported as such.
++            const provenBaseLag = async (olderBase, liveBase) => {
++              let comparison;
++              try {
++                comparison = (await github.rest.repos.compareCommitsWithBasehead({
++                  owner, repo, basehead: `${olderBase}...${liveBase}`, per_page: 1,
++                })).data;
++              } catch (error) {
++                if (error?.status === 403 || error?.status === 429) throw error;
++                return 0;
++              }
++              return comparison?.status === 'ahead' && comparison.behind_by === 0 &&
++                Number.isSafeInteger(comparison.ahead_by) && comparison.ahead_by > 0
++                ? comparison.ahead_by
++                : 0;
+             };
+             const mergeRefStartedAt = Date.now();
+             let mergeSha;
+@@ -357,14 +388,22 @@
+                 });
+                 const parents = (mergeCommit.data.parents || []).map((parent) => parent.sha?.toLowerCase());
+                 const mergeTreeSha = mergeCommit.data.commit?.tree?.sha?.toLowerCase();
++                let baseLag = 0;
+                 if (parents.length !== 2 || parents[0] !== liveBaseSha || parents[1] !== headSha) {
+-                  const error = new Error('synthetic merge ref parents did not match the live PR');
+                   // The exact head on an older base means GitHub has not yet
+-                  // rebuilt the preview after the base advanced.
+-                  error.code = parents.length === 2 && parents[1] === headSha
+-                    ? 'MERGE_REF_BASE_STALE'
+-                    : 'MERGE_REF_PARENTS_INVALID';
+-                  throw error;
++                  // rebuilt the preview after the base advanced. Only once the
++                  // window is spent, and only for a base parent the live tip
++                  // descends from, is that preview reviewed as it is.
++                  const exactHeadOnOlderBase = parents.length === 2 && parents[1] === headSha &&
++                    /^[0-9a-f]{40}$/.test(parents[0] || '') && parents[0] !== liveBaseSha;
++                  if (exactHeadOnOlderBase && attempt === mergeRefMaxAttempts) {
++                    baseLag = await provenBaseLag(parents[0], liveBaseSha);
++                  }
++                  if (baseLag < 1) {
++                    const error = new Error('synthetic merge ref parents did not match the live PR');
++                    error.code = exactHeadOnOlderBase ? 'MERGE_REF_BASE_STALE' : 'MERGE_REF_PARENTS_INVALID';
++                    throw error;
++                  }
+                 }
+                 if (!/^[0-9a-f]{40}$/.test(mergeTreeSha || '')) {
+                   const error = new Error('synthetic merge tree did not resolve to a full SHA');
+@@ -379,9 +418,13 @@
+                   error.code = 'MERGE_REF_BASE_CHANGED';
+                   throw error;
+                 }
+-                baseSha = liveBaseSha;
++                // The receipt binds the base the review actually saw.
++                baseSha = baseLag > 0 ? parents[0] : liveBaseSha;
+                 mergeSha = candidateMergeSha;
+                 core.setOutput('merge_tree_sha', mergeTreeSha);
++                if (baseLag > 0) {
++                  core.notice(`AI_CLI_REVIEW_MERGE_REF_OLDER_BASE:attempt=${attempt}:base_lag_commits=${baseLag}`);
++                }
+                 break;
+               } catch (error) {
+                 lastMergeRefFailure = safeMergeRefFailure(error);
+@@ -440,6 +483,35 @@
+           persist-credentials: false
+           submodules: false
+ 
++      - name: Mint the dedicated Skills dependency reader token
++        if: github.repository == 'Schneider-Innovations/snd-agent-workflows' && vars.DEPENDENCY_PIN_READER_APP_ID != ''
++        id: dependency-reader-token
++        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
++        with:
++          app-id: ${{ vars.DEPENDENCY_PIN_READER_APP_ID }}
++          private-key: ${{ secrets.DEPENDENCY_PIN_READER_APP_PRIVATE_KEY }}
++          owner: Schneider-Innovations
++          repositories: snd-agent-skills
++          permission-checks: read
++          permission-contents: read
++          permission-metadata: read
++          permission-pull-requests: read
++
++      - name: Verify the dedicated reader installation identity
++        if: github.repository == 'Schneider-Innovations/snd-agent-workflows' && vars.DEPENDENCY_PIN_READER_APP_ID != ''
++        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
++        env:
++          APP_ID: ${{ vars.DEPENDENCY_PIN_READER_APP_ID }}
++          APP_SLUG: ${{ steps.dependency-reader-token.outputs.app-slug }}
++          INSTALLATION_ID: ${{ steps.dependency-reader-token.outputs.installation-id }}
++        with:
++          script: |
++            if (process.env.APP_ID !== '5504630' ||
++                process.env.APP_SLUG !== 'snd-skills-dependency-reader' ||
++                process.env.INSTALLATION_ID !== '176030942') {
++              core.setFailed('AI_REVIEW_DEPENDENCY_READER_IDENTITY_MISMATCH');
++            }
++
+       - id: pins
+         name: Verify the Skills dependency pin with a read-only token
+         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+@@ -447,9 +519,10 @@
+         env:
+           # Native Node fetch must use the runner's existing restricted proxy.
+           NODE_USE_ENV_PROXY: '1'
+-          # The only reference to this secret. It is read-only on
+-          # snd-agent-skills and never reaches a log, an output or a file.
+-          DEPENDENCY_PIN_READ_TOKEN: ${{ secrets.DEPENDENCY_PIN_READ_TOKEN }}
++          # A configured App must mint and pass identity verification above.
++          # The legacy PAT remains unchanged for callers without App config.
++          # The token never reaches the isolated review worker or an artifact.
++          DEPENDENCY_PIN_READ_TOKEN: ${{ vars.DEPENDENCY_PIN_READER_APP_ID != '' && steps.dependency-reader-token.outputs.token || secrets.DEPENDENCY_PIN_READ_TOKEN }}
+           BASE_SHA: ${{ steps.context.outputs.base_sha }}
+           MERGE_SHA: ${{ steps.context.outputs.merge_sha }}
+           REPOSITORY: ${{ github.repository }}
+@@ -1618,10 +1691,12 @@
+               }
+               const activeDeadline = processingDeadline ?? queueDeadline;
+               if (now >= activeDeadline) break;
+-              // A result for a head or base that is no longer live is always
+-              // rejected by the binding check below, so waiting for it only
+-              // spends model and runner time. Every two minutes, check the
+-              // PR and protected base (two reads); on a change stop waiting.
++              // A result for a head that is no longer live is always rejected
++              // by the binding check below, so waiting for it only spends
++              // model and runner time. Every two minutes, read the PR; on a
++              // new head, a closed or a draft PR stop waiting. A protected
++              // base that only moved forward keeps the review alive: the
++              // binding check accepts it (platform-infrastructure#3479).
+               // The binding check then fails this job and the terminal step
+               // withdraws the request through the existing cancel path. An
+               // unreadable API state keeps waiting: this is only an early
+@@ -1635,21 +1710,16 @@
+                     ...context.repo, pull_number: Number(process.env.PR_NUMBER),
+                     request: { signal: AbortSignal.timeout(10 * 1000) },
+                   })).data;
+-                  const liveBase = (await github.rest.git.getRef({
+-                    ...context.repo, ref: `heads/${process.env.BASE_BRANCH || 'main'}`,
+-                    request: { signal: AbortSignal.timeout(10 * 1000) },
+-                  })).data.object?.sha?.toLowerCase();
+                   const liveHead = livePr.head?.sha?.toLowerCase();
+                   // Only a well-formed observation may withdraw a request; a
+                   // missing or malformed value is an ambiguous read and waits.
+                   const readable = typeof livePr.state === 'string' && typeof livePr.draft === 'boolean' &&
+-                    /^[0-9a-f]{40}$/.test(liveHead || '') && /^[0-9a-f]{40}$/.test(liveBase || '') &&
+-                    /^[0-9a-f]{40}$/.test(process.env.HEAD_SHA || '') &&
+-                    /^[0-9a-f]{40}$/.test(process.env.BASE_SHA || '');
++                    /^[0-9a-f]{40}$/.test(liveHead || '') &&
++                    /^[0-9a-f]{40}$/.test(process.env.HEAD_SHA || '');
+                   if (!readable) {
+                     core.info('AI_CLI_REVIEW_LIVE_BINDING_UNREADABLE:malformed');
+                   } else if (livePr.state !== 'open' || livePr.draft === true ||
+-                      liveHead !== process.env.HEAD_SHA || liveBase !== process.env.BASE_SHA) {
++                      liveHead !== process.env.HEAD_SHA) {
+                     core.setOutput('superseded', 'true');
+                     core.notice('AI_CLI_REVIEW_SUPERSEDED_WHILE_WAITING');
+                     break;
+@@ -1687,10 +1757,29 @@
+               const parents = (mergeCommit.data.parents || []).map((parent) => parent.sha?.toLowerCase());
+               const tree = mergeCommit.data.commit?.tree?.sha?.toLowerCase();
+               if (pr.state !== 'open' || pr.draft || pr.base.ref !== (process.env.BASE_BRANCH || 'main') ||
+-                  pr.head.sha?.toLowerCase() !== expectedHead || base !== expectedBase ||
+-                  tree !== expectedMergeTree ||
+-                  parents.length !== 2 || parents[0] !== expectedBase || parents[1] !== expectedHead) {
++                  pr.head.sha?.toLowerCase() !== expectedHead ||
++                  !/^[0-9a-f]{40}$/.test(base || '') ||
++                  parents.length !== 2 || parents[1] !== expectedHead) {
+                 throw new Error('AI_CLI_REVIEW_LIVE_BINDING_CHANGED');
++              }
++              // The reviewed base may only have been overtaken by the
++              // protected branch (platform-infrastructure#3479): the live tip
++              // must descend from it, and the live preview is either the
++              // reviewed one or GitHub's rebuild on that tip. A new head, any
++              // other parent, a rewritten base or an unprovable comparison
++              // fails closed.
++              const reviewedPreview = parents[0] === expectedBase && tree === expectedMergeTree;
++              const rebuiltPreview = base !== expectedBase && parents[0] === base;
++              if (!reviewedPreview && !rebuiltPreview) {
++                throw new Error('AI_CLI_REVIEW_LIVE_BINDING_CHANGED');
++              }
++              if (base !== expectedBase) {
++                const comparison = (await github.rest.repos.compareCommitsWithBasehead({
++                  ...context.repo, basehead: `${expectedBase}...${base}`, per_page: 1,
++                })).data;
++                if (comparison?.status !== 'ahead' || comparison.behind_by !== 0) {
++                  throw new Error('AI_CLI_REVIEW_LIVE_BINDING_CHANGED');
++                }
+               }
+               return { base, head: expectedHead, merge, tree };
+             };
+@@ -3091,6 +3180,7 @@
+           MERGE_SHA: ${{ needs.prepare-cli-review.outputs.merge_sha }}
+           MERGE_TREE_SHA: ${{ needs.prepare-cli-review.outputs.merge_tree_sha }}
+           MERGE_BASE_SHA: ${{ needs.prepare-cli-review.outputs.merge_base_sha }}
++          REVIEWED_BASE_SHA: ${{ needs.prepare-cli-review.outputs.base_sha }}
+           HEAD_CHECK_RUN_ID: ${{ needs.prepare-cli-review.outputs.head_check_run_id }}
+           RUN_ATTEMPT: ${{ github.run_attempt }}
+           REQUEST_GENERATION: ${{ inputs.request_generation }}
+@@ -3257,16 +3347,33 @@
+                 headData.status === 'completed' &&
+                 headData.head_sha?.toLowerCase() === headSha;
+               const trustedBinding = headOutput?.trusted_binding;
++              // A receipt binds the base it reviewed. The protected branch may
++              // have moved past it since (platform-infrastructure#3479); that
++              // base is accepted only when the live tip provably descends
++              // from it, and such a receipt can never make this Request green.
++              const reviewedBaseSha = (process.env.REVIEWED_BASE_SHA || '').toLowerCase();
++              let reviewedBaseOvertaken = false;
++              if (terminalReceipt && /^[0-9a-f]{40}$/.test(reviewedBaseSha) && reviewedBaseSha !== protectedBaseSha) {
++                try {
++                  const comparison = (await github.rest.repos.compareCommitsWithBasehead({
++                    ...context.repo, basehead: `${reviewedBaseSha}...${protectedBaseSha}`, per_page: 1,
++                  })).data;
++                  reviewedBaseOvertaken = comparison?.status === 'ahead' && comparison.behind_by === 0;
++                } catch {
++                  reviewedBaseOvertaken = false;
++                }
++              }
+               const receiptBinding = terminalReceipt &&
++                (reviewedBaseSha === protectedBaseSha || reviewedBaseOvertaken) &&
+                 headOutput?.head_sha?.toLowerCase() === headSha &&
+                 headOutput?.merge_sha?.toLowerCase() === mergeSha &&
+-                headOutput?.base_sha?.toLowerCase() === protectedBaseSha &&
++                headOutput?.base_sha?.toLowerCase() === reviewedBaseSha &&
+                 headOutput?.merge_base_sha?.toLowerCase() === mergeBaseSha &&
+                 Number(headOutput?.pr_number) === pr.number &&
+                 trustedBinding?.schema === 'ai-review-head-binding/v1' &&
+                 trustedBinding?.repository === `${context.repo.owner}/${context.repo.repo}` &&
+                 Number(trustedBinding?.pr_number) === pr.number &&
+-                trustedBinding?.base_sha?.toLowerCase() === protectedBaseSha &&
++                trustedBinding?.base_sha?.toLowerCase() === reviewedBaseSha &&
+                 trustedBinding?.head_sha?.toLowerCase() === headSha &&
+                 trustedBinding?.reviewed_merge_sha?.toLowerCase() === mergeSha &&
+                 trustedBinding?.merge_tree_sha?.toLowerCase() === mergeTreeSha &&
+@@ -3278,6 +3385,9 @@
+               const receiptGenerationBinding = Boolean(generationStartedAt);
+               let liveMergeSha = null;
+               let liveMergeTreeSha = null;
++              // An overtaken receipt still needs the live preview to be either
++              // the reviewed one or GitHub's rebuild of this head on the tip.
++              let overtakenPreview = false;
+               try {
+                 liveMergeSha = (await github.rest.git.getRef({
+                   ...context.repo,
+@@ -3285,13 +3395,17 @@
+                 })).data.object?.sha?.toLowerCase() || null;
+                 const liveMerge = await github.rest.repos.getCommit({ ...context.repo, ref: liveMergeSha });
+                 const parents = (liveMerge.data.parents || []).map((parent) => parent.sha?.toLowerCase());
++                const liveTree = liveMerge.data.commit?.tree?.sha?.toLowerCase() || null;
+                 liveMergeTreeSha = parents.length === 2 &&
+                   parents[0] === protectedBaseSha && parents[1] === headSha
+-                  ? liveMerge.data.commit?.tree?.sha?.toLowerCase() || null
++                  ? liveTree
+                   : null;
++                overtakenPreview = reviewedBaseOvertaken && parents.length === 2 && parents[1] === headSha &&
++                  (parents[0] === protectedBaseSha || (parents[0] === reviewedBaseSha && liveTree === mergeTreeSha));
+               } catch {
+                 liveMergeSha = null;
+                 liveMergeTreeSha = null;
++                overtakenPreview = false;
+               }
+               const newestReceipt = (candidates) => candidates
+                 .filter((check) => check.name === 'ai-review/receipt')
+@@ -3328,6 +3442,31 @@
+                   ? 'review_approved_deferred_findings'
+                   : 'review_approved';
+                 outcome = 'PASS';
++                nextAction = 'none';
++              } else if (
++                reviewedBaseOvertaken &&
++                receiptBinding &&
++                receiptGenerationBinding &&
++                overtakenPreview &&
++                newestReceipt(checks)?.id === headData.id &&
++                newestRequest?.id === requestCheck.id &&
++                pr.state === 'open' &&
++                pr.draft === false &&
++                pr.base.ref === baseBranch &&
++                pr.head.sha?.toLowerCase() === headSha &&
++                pr.head.repo?.full_name === `${context.repo.owner}/${context.repo.repo}` &&
++                (pr.labels || []).some((label) => label.name === requiredLabel) &&
++                headData.conclusion === 'success' &&
++                headOutput?.status === 'completed' &&
++                (headOutput?.decision === 'PASS' || headOutput?.decision === 'BLOCK')
++              ) {
++                // The same terminal state as a base that advanced after an
++                // exact-head success (snd-quality-gate#352): the receipt keeps
++                // its reviewed base and the merge gates judge the drift; this
++                // scheduling contract ends neutral, never success.
++                phase = 'SUPERSEDED';
++                reasonCode = 'base_advanced_after_receipt';
++                outcome = null;
+                 nextAction = 'none';
+               } else if (receiptBinding && headOutput?.decision === 'BLOCK') {
+                 phase = 'BLOCKED';
