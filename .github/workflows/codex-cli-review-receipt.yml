@@ -108,7 +108,7 @@ jobs:
       merge_tree_sha: ${{ steps.context.outputs.merge_tree_sha }}
       merge_ref_attempts: ${{ steps.context.outputs.merge_ref_attempts }}
       merge_ref_wait_ms: ${{ steps.context.outputs.merge_ref_wait_ms }}
-      prepare_failure: ${{ steps.context.outputs.prepare_failure }}
+      prepare_failure: ${{ steps.context.outputs.prepare_failure || steps.fixtures.outputs.prepare_failure }}
       merge_base_sha: ${{ steps.input.outputs.merge_base_sha }}
       referenced_context_r2: ${{ steps.input.outputs.referenced_context_r2 }}
       digest_checks: ${{ steps.input.outputs.digest_checks }}
@@ -363,6 +363,9 @@ jobs:
                 if (livePr.mergeable === false) {
                   unmergeableReads += 1;
                   if (unmergeableReads >= 2) {
+                    // Name the conflict so the finalizer asks the author to
+                    // resolve it instead of reporting a gate outage.
+                    core.setOutput('prepare_failure', 'pr_not_mergeable');
                     core.setFailed(`AI_CLI_REVIEW_PR_NOT_MERGEABLE:attempt=${attempt}:mergeable_state=${
                       /^[a-z_]{1,32}$/.test(livePr.mergeable_state || '') ? livePr.mergeable_state : 'unknown'}`);
                     return;
@@ -482,6 +485,64 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           submodules: false
+
+      # pi#3602: the Review Agent rejects an allow-listed gzip fixture that is
+      # empty, over its byte limit or not gzip data, seconds after admission,
+      # as review_context_invalid. Its size and signature are known from the
+      # merge preview, so stop here, before anything is queued, and name it.
+      # Mirror of platform-infrastructure codex-review-agent.py
+      # GZIP_FIXTURE_PATHS_BY_REPOSITORY / GZIP_FIXTURE_MAX_BYTES_BY_PATTERN /
+      # MAX_GZIP_FIXTURE_BYTES. A limit here must never be below the Agent's
+      # (this check would block what the Agent accepts); the Agent stays the
+      # authority for anything this check lets through.
+      - id: fixtures
+        name: Check allow-listed gzip fixtures before queuing
+        env:
+          BASE_SHA: ${{ steps.context.outputs.base_sha }}
+          MERGE_SHA: ${{ steps.context.outputs.merge_sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$MERGE_SHA"
+          git diff --no-ext-diff --no-textconv --no-renames --diff-filter=d --name-only -z "$BASE_SHA" "$MERGE_SHA" -- |
+            node -e '
+          const { execFileSync } = require("child_process");
+          const fs = require("fs");
+          const MIB = 1024 * 1024;
+          const DEFAULT_MAX_BYTES = 2 * MIB;
+          const FIXTURES_BY_REPOSITORY = {
+            "Schneider-Innovations/snd-agent-workflows": [
+              { pattern: "apps/worker/tests/fixtures/heal_*_golden.json.gz", maxBytes: 6 * MIB },
+            ],
+          };
+          const segment = (glob) => new RegExp("^" + glob.split("").map((c) =>
+            c === "*" ? "[^/]*" : c === "?" ? "[^/]" : c.replace(/[\\^$.|+()[\]{}]/g, "\\$&")).join("") + "$");
+          const fixtures = (FIXTURES_BY_REPOSITORY[process.env.REPOSITORY] || []).map((entry) => ({
+            ...entry, segments: entry.pattern.split("/").map(segment),
+          }));
+          const changed = fs.readFileSync(0).toString("utf8").split("\0").filter(Boolean);
+          const printable = (path) => /^[A-Za-z0-9._\/-]{1,512}$/.test(path) ? path : "<unprintable path>";
+          for (const path of changed) {
+            const parts = path.split("/");
+            const fixture = fixtures.find((entry) => entry.segments.length === parts.length &&
+              entry.segments.every((regex, index) => regex.test(parts[index])));
+            if (!fixture) continue;
+            const object = `${process.env.MERGE_SHA}:${path}`;
+            const bytes = Number(execFileSync("git", ["cat-file", "-s", object]).toString().trim());
+            let detail = null;
+            if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > fixture.maxBytes) {
+              detail = "gzip_fixture_size_limit";
+            } else {
+              const head = execFileSync("git", ["cat-file", "blob", object], { maxBuffer: fixture.maxBytes + 1 });
+              if (!(head[0] === 0x1f && head[1] === 0x8b && head[2] === 0x08)) detail = "gzip_fixture_magic_mismatch";
+            }
+            if (detail) {
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, `prepare_failure=${detail}\n`);
+              console.log(`::error::AI_CLI_REVIEW_INPUT_REJECTED:${detail}:path=${printable(path)}:bytes=${bytes}:limit=${fixture.maxBytes}`);
+              process.exit(1);
+            }
+          }
+          '
 
       - name: Mint the dedicated Skills dependency reader token
         if: github.repository == 'Schneider-Innovations/snd-agent-workflows' && vars.DEPENDENCY_PIN_READER_APP_ID != ''
@@ -724,13 +785,18 @@ jobs:
               };
               let requests = 0;
               // One GET, no retries. Any non-2xx is api_error, except where a
-              // 404 itself is the answer (a missing release).
+              // 404 itself is the answer (a missing release) or a 401/403 was
+              // classified by dependencyPinAuthReason (a fixed code, no text).
               const get = async (path, notFoundReason = null) => {
                 requests += 1;
                 ensure(requests <= MAX_REQUESTS, 'api_error');
                 let response;
                 try { response = await api(path); } catch { throw new Unverified('api_error'); }
                 if (notFoundReason !== null && response?.status === 404) throw new Unverified(notFoundReason);
+                if ((response?.status === 401 || response?.status === 403) &&
+                    DEPENDENCY_PIN_AUTH_REASONS.includes(response?.auth)) {
+                  throw new Unverified(response.auth);
+                }
                 ensure(Number.isInteger(response?.status) && response.status >= 200 && response.status <= 299, 'api_error');
                 return response.body;
               };
@@ -841,6 +907,21 @@ jobs:
                   reason: error instanceof Unverified ? error.reason : 'api_error' });
               }
             }
+            // A rejected or unsupported credential is told apart from a generic
+            // api_error (qg#425: fine-grained PATs cannot read the Checks API).
+            // Only these fixed codes leave this function; the response text,
+            // headers and token never do. Anything else stays api_error.
+            const DEPENDENCY_PIN_AUTH_REASONS = ['credential_rejected', 'credential_unsupported',
+              'credential_permission_missing'];
+            function dependencyPinAuthReason(status, text) {
+              if (status === 401) return 'credential_rejected';
+              if (status !== 403) return null;
+              let message = null;
+              try { message = JSON.parse(text)?.message; } catch { return null; }
+              if (message === 'Resource not accessible by personal access token') return 'credential_unsupported';
+              if (message === 'Resource not accessible by integration') return 'credential_permission_missing';
+              return null;
+            }
             // END DEPENDENCY PIN CHECKS
             const { execFileSync } = require('child_process');
             const git = (args) => execFileSync('git', args, {
@@ -876,7 +957,10 @@ jobs:
                 if (size > MAX_RESPONSE_BYTES) throw new Error('response too large');
                 chunks.push(chunk);
               }
-              if (response.status < 200 || response.status > 299) return { status: response.status, body: null };
+              if (response.status < 200 || response.status > 299) {
+                return { status: response.status, body: null,
+                  auth: dependencyPinAuthReason(response.status, Buffer.concat(chunks).toString('utf8')) };
+              }
               return { status: response.status, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) };
             };
             const checks = await buildDependencyPinChecks({
@@ -2336,7 +2420,31 @@ jobs:
                     : receipt.failure.failure_stage.endsWith('_lines') ? 'lines' : 'bytes',
                 }
               : null;
-            const suppliedContextFailureValid = !contextFailureSupplied || suppliedContextFailure !== null;
+            // pi#3602: review_context_invalid may name its cause in one
+            // bounded detail_code. Static codes come from the Review Agent's
+            // input checks; site:<function> names the Agent function that
+            // rejected an input with no finer code. Nothing else is accepted.
+            const contextInvalidDetailCodes = new Set([
+              'gzip_fixture_size_limit',
+              'gzip_fixture_magic_mismatch',
+              'static_image_path_not_allowed',
+              'static_image_content_not_allowed',
+              'static_image_size_limit',
+              'static_image_magic_mismatch',
+              'static_image_header_invalid',
+              'static_image_dimensions_invalid',
+              'static_image_dimensions_limit',
+            ]);
+            const suppliedContextInvalid = receipt?.reason_code === 'review_context_invalid' &&
+              receipt.failure && typeof receipt.failure === 'object' && !Array.isArray(receipt.failure) &&
+              Object.keys(receipt.failure).join(',') === 'detail_code' &&
+              typeof receipt.failure.detail_code === 'string' &&
+              (contextInvalidDetailCodes.has(receipt.failure.detail_code) ||
+                /^site:[a-z_][a-z0-9_]{0,63}$/.test(receipt.failure.detail_code))
+              ? { detail_code: receipt.failure.detail_code }
+              : null;
+            const suppliedContextFailureValid = !contextFailureSupplied ||
+              suppliedContextFailure !== null || suppliedContextInvalid !== null;
             const executionFailureEnvelope = receipt && (
               receipt.result_kind === undefined || (
                 receipt.result_kind === 'execution_failure' &&
@@ -2437,6 +2545,7 @@ jobs:
               bridge_failure_signals,
               bridge_retry_after_seconds,
               context_failure: suppliedContextFailure,
+              context_invalid: suppliedContextInvalid,
             };
             output = {
               ...output,
@@ -2495,6 +2604,39 @@ jobs:
                   `${Math.ceil(suppliedContextFailure.actual_bytes / 1024)} KiB supplied, ` +
                   `${Math.ceil(suppliedContextFailure.limit_bytes / 1024)} KiB allowed.`
               : null;
+            // pi#3602: tell the author why the input was rejected and what to
+            // change, instead of a bare review_context_invalid.
+            const contextInvalidDetail = suppliedContextInvalid?.detail_code ?? null;
+            const contextInvalidGuidance = {
+              gzip_fixture_size_limit:
+                'An allow-listed gzip test fixture (*.json.gz) is larger than its review limit. ' +
+                'Generate the fixture in the test, shrink it, or move it to its own PR, then request a new review.',
+              gzip_fixture_magic_mismatch:
+                'An allow-listed *.json.gz test fixture is not gzip data. ' +
+                'Commit it gzip-compressed, then request a new review.',
+              static_image_path_not_allowed:
+                'A changed image is outside the image paths the review accepts for this repository. ' +
+                'Move it to an allowed path or out of this PR, then request a new review.',
+              static_image_content_not_allowed:
+                'A changed image at a content-pinned path no longer matches its pinned bytes. ' +
+                'Restore the pinned image or update its pin in the review policy, then request a new review.',
+              static_image_size_limit:
+                'A changed image is larger than the review limit. Shrink it, then request a new review.',
+              static_image_magic_mismatch:
+                'A changed image does not match its file extension. Fix the file, then request a new review.',
+              static_image_header_invalid:
+                'A changed image has a malformed header. Re-export it, then request a new review.',
+              static_image_dimensions_invalid:
+                'A changed image has invalid dimensions. Re-export it, then request a new review.',
+              static_image_dimensions_limit:
+                'A changed image is larger than the allowed dimensions. Resize it, then request a new review.',
+            };
+            const contextInvalidSummary = contextInvalidDetail === null
+              ? null
+              : contextInvalidDetail.startsWith('site:')
+                ? `Review input rejected by the Review Agent check ${contextInvalidDetail.slice(5)}. ` +
+                  'Requesting the review again repeats this result: report this check link to the review gate owner.'
+                : `Review input rejected (${contextInvalidDetail}). ${contextInvalidGuidance[contextInvalidDetail]}`;
             // Keep model-authored prose private. Expose only bounded, validated
             // decision metadata and a stable link to the immutable Check run.
             const originalCheckId = Number(process.env.HEAD_CHECK_RUN_ID);
@@ -2543,12 +2685,18 @@ jobs:
                   ? 'Codex CLI review too large: split the PR into smaller PRs'
                 : suppliedContextFailure
                   ? 'Codex CLI review context exceeds configured limit'
+                : contextInvalidDetail?.startsWith('gzip_fixture_')
+                  ? 'Codex CLI review input rejected: fix the gzip test fixture'
+                : contextInvalidDetail?.startsWith('static_image_')
+                  ? 'Codex CLI review input rejected: fix the changed image'
+                : contextInvalidDetail
+                  ? 'Codex CLI review input rejected by the Review Agent'
                 : reason === 'rerun_result_unavailable'
                   ? 'Codex CLI review re-run cannot recover the result: request a new review'
                   : 'Codex CLI review receipt not ready',
               summary: conclusion === 'success'
                 ? `${output.summary}${mergeRefObservation}`
-                : (contextFailureSummary || `Fail-closed Shadow result: ${reason}.`) +
+                : (contextFailureSummary || contextInvalidSummary || `Fail-closed Shadow result: ${reason}.`) +
                   (reason === 'rerun_result_unavailable' ? ` ${rerunGuidance}` : '') +
                   (contractFailureCodes.length > 0
                     ? ` Contract diagnostics: ${contractFailureCodes.join(', ')}.` : '') +
@@ -3342,6 +3490,26 @@ jobs:
               reasonCode = 'merge_preview_stale';
               nextAction = 'update_branch';
             }
+            // A PR that conflicts with its base also needs the author: ARCP v2
+            // pairs merge_conflict with resolve_conflicts (pi#3555). It stays
+            // a fail-closed terminal UNAVAILABLE.
+            const mergeConflict = prepareResult === 'failure' &&
+              process.env.PREPARE_FAILURE === 'pr_not_mergeable';
+            if (mergeConflict) {
+              reasonCode = 'merge_conflict';
+              nextAction = 'resolve_conflicts';
+            }
+            // pi#3602: Prepare found an allow-listed gzip fixture the Review
+            // Agent would reject, before queuing. The author fixes the input;
+            // ARCP v2 pairs review_input_rejected with fix_review_input. It
+            // stays a fail-closed terminal UNAVAILABLE.
+            const inputRejection = prepareResult === 'failure' &&
+              ['gzip_fixture_size_limit', 'gzip_fixture_magic_mismatch'].includes(process.env.PREPARE_FAILURE)
+              ? process.env.PREPARE_FAILURE : null;
+            if (inputRejection) {
+              reasonCode = 'review_input_rejected';
+              nextAction = 'fix_review_input';
+            }
             const baseBranch = process.env.BASE_BRANCH || 'main';
             const requiredLabel = process.env.REQUIRED_LABEL || 'ready-for-final-review';
             if (headCheckId && /^[0-9a-f]{40}$/.test(mergeSha) && /^[0-9a-f]{40}$/.test(mergeTreeSha)) {
@@ -3765,6 +3933,12 @@ jobs:
                         : 'Investigate the inconclusive review evidence and request a fresh review.'
                       : stalePreview
                         ? `GitHub did not rebuild this pull request's merge preview after ${baseBranch} advanced, so the review never started. Relabeling repeats this failure: update the branch from ${baseBranch}, then apply ${requiredLabel} again.`
+                        : mergeConflict
+                          ? `This pull request has merge conflicts with ${baseBranch}, so GitHub cannot build its merge preview and the review never started. The review system is healthy and relabeling repeats this failure: resolve the conflicts with ${baseBranch}, push, then apply ${requiredLabel} again.`
+                        : inputRejection === 'gzip_fixture_size_limit'
+                          ? `An allow-listed gzip test fixture (*.json.gz) is empty or larger than its review limit, so the review never started (the Prepare log names the file). Relabeling repeats this failure: generate the fixture in the test, shrink it, or move it to its own PR, push, then apply ${requiredLabel} again.`
+                        : inputRejection === 'gzip_fixture_magic_mismatch'
+                          ? `An allow-listed *.json.gz test fixture is not gzip data, so the review never started (the Prepare log names the file). Relabeling repeats this failure: commit it gzip-compressed, push, then apply ${requiredLabel} again.`
                         : baseAdvancedAfterReceipt
                           ? `The exact-head review succeeded, but ${baseBranch} advanced before this scheduling contract closed. ai-review/receipt stays bound to the reviewed base; if a merge gate needs the current base, update the branch from ${baseBranch} and apply ${requiredLabel} again.`
                           : 'Restore the trusted review gate, then request a fresh exact-head review.',
@@ -3790,6 +3964,10 @@ jobs:
                       ? 'AI review completed without a conclusive decision'
                       : stalePreview
                         ? `AI review not started: update the branch from ${baseBranch}`
+                        : mergeConflict
+                          ? `AI review not started: resolve the merge conflicts with ${baseBranch}`
+                        : inputRejection
+                          ? 'AI review not started: fix the gzip test fixture'
                         : baseAdvancedAfterReceipt
                           ? `AI review completed; ${baseBranch} advanced after the receipt`
                           : 'AI review lifecycle unavailable',
